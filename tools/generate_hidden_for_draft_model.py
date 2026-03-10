@@ -16,7 +16,6 @@ import argparse
 import json
 import logging
 import os
-import json
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -130,6 +129,7 @@ class HiddenStateGenerator:
                     images = [load_image(p) for p in image_paths]
                     processor = self.target_model.tokenizer
                     if hasattr(processor, "image_processor"):
+                        # qwen3_vl: get vision encodings from image_processor
                         vision_encoding = processor.image_processor(
                             images=images, return_tensors="pt"
                         )
