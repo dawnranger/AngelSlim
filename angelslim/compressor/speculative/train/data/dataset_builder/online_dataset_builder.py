@@ -292,6 +292,7 @@ class OnlineVLMDatasetBuilder(OnlineDatasetBuilder):
                 "image_paths": json.dumps(image_paths),
             }
 
+
             return result_dict
 
         except Exception as e:
