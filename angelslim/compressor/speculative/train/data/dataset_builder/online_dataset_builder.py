@@ -294,7 +294,6 @@ class OnlineVLMDatasetBuilder(OnlineDatasetBuilder):
             }
 
 
-
             return result_dict
 
         except Exception as e:
