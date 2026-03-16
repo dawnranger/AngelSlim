@@ -131,7 +131,11 @@ class Eagle3Trainer(Trainer, ABC):
             position_ids = torch.arange(0, seq_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
-            position_ids = position_ids.view(-1, seq_length).long()
+            if position_ids.ndim == 3:
+                # MRoPE format: (3, batch, seq_len), keep as-is
+                position_ids = position_ids.long()
+            else:
+                position_ids = position_ids.view(-1, seq_length).long()
 
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, seq_length), dtype=torch.bool, device=device)
