@@ -431,6 +431,11 @@ def main():
     """Main execution function."""
     # Setup distributed environment
     rank, world_size, local_rank = setup_distributed()
+    logger.info(
+        f"Distributed environment initialized: pid: {os.getpid()}, rank {rank},"
+        "world_size {world_size}, local_rank {local_rank}",
+        extra={"rank": rank},
+    )
 
     # Parse arguments
     args = parse_arguments()
@@ -452,7 +457,8 @@ def main():
             f"Target model loaded: {args.target_model_name_or_path or args.model_name}",
             extra={"rank": rank},
         )
-        logger.info(f"tokenizer: {target_model.tokenizer}")
+        if rank == 0:
+            logger.info(f"tokenizer: {target_model.tokenizer}", extra={"rank": 0})
 
         # Load dataset
         dataset = load_dataset(args, target_model.tokenizer, rank)
@@ -469,9 +475,22 @@ def main():
         generator = HiddenStateGenerator(target_model, output_dir, rank=rank)
         successful, failed = generator.generate(dataset_slice)
 
+        logger.info(
+            f"Rank {rank} - Successful: {successful}, Failed: {failed}",
+            extra={"rank": rank},
+        )
+
+    except Exception as e:
+        logger.error(f"Rank {rank} encountered error: {e}", extra={"rank": rank})
+
+    finally:
         # Synchronize all processes
         if world_size > 1:
+            logger.info(
+                f"Rank {rank} reached barrier, waiting for other ranks...", extra={"rank": rank}
+            )
             dist.barrier()
+            logger.info(f"Rank {rank} passed barrier.", extra={"rank": rank})
 
         # Log final statistics (only on rank 0)
         if rank == 0:
@@ -483,12 +502,6 @@ def main():
             )
             logger.info("=" * 50, extra={"rank": rank})
 
-        logger.info(
-            f"Rank {rank} - Successful: {successful}, Failed: {failed}",
-            extra={"rank": rank},
-        )
-
-    finally:
         # Cleanup distributed environment
         cleanup_distributed()
 

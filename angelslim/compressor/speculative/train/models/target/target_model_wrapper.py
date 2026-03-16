@@ -369,9 +369,9 @@ class VLMTransformersBackend(BaseBackend):
 
         def hook(module, args, kwargs):
             if "inputs_embeds" in kwargs and kwargs["inputs_embeds"] is not None:
-                inputs_embeds_list.append(kwargs["inputs_embeds"].clone().detach().cpu())
+                inputs_embeds_list.append(kwargs["inputs_embeds"].clone().detach())
             if "position_ids" in kwargs and kwargs["position_ids"] is not None:
-                position_ids_list.append(kwargs["position_ids"].clone().detach().cpu())
+                position_ids_list.append(kwargs["position_ids"].clone().detach())
             return args, kwargs
 
         if self.target_model_type == "qwen3_vl":
@@ -439,9 +439,9 @@ class VLMTransformersBackend(BaseBackend):
 
         def hook(module, args, kwargs):
             if "inputs_embeds" in kwargs and kwargs["inputs_embeds"] is not None:
-                inputs_embeds_list.append(kwargs["inputs_embeds"].clone().detach().cpu())
+                inputs_embeds_list.append(kwargs["inputs_embeds"].clone().detach())
             if "position_ids" in kwargs and kwargs["position_ids"] is not None:
-                position_ids_list.append(kwargs["position_ids"].clone().detach().cpu())
+                position_ids_list.append(kwargs["position_ids"].clone().detach())
             return args, kwargs
 
         if self.target_model_type == "qwen3_vl":
@@ -571,9 +571,9 @@ class AudioTransformersBackend(BaseBackend):
 
         def hook(module, args, kwargs):
             if "inputs_embeds" in kwargs and kwargs["inputs_embeds"] is not None:
-                inputs_embeds_list.append(kwargs["inputs_embeds"].clone().detach().cpu())
+                inputs_embeds_list.append(kwargs["inputs_embeds"].clone().detach())
             if "position_ids" in kwargs and kwargs["position_ids"] is not None:
-                position_ids_list.append(kwargs["position_ids"].clone().detach().cpu())
+                position_ids_list.append(kwargs["position_ids"].clone().detach())
             return args, kwargs
 
         handle = self.model.language_model.register_forward_pre_hook(hook, with_kwargs=True)
@@ -627,9 +627,9 @@ class AudioTransformersBackend(BaseBackend):
 
         def hook(module, args, kwargs):
             if "inputs_embeds" in kwargs and kwargs["inputs_embeds"] is not None:
-                inputs_embeds_list.append(kwargs["inputs_embeds"].clone().detach().cpu())
+                inputs_embeds_list.append(kwargs["inputs_embeds"].clone().detach())
             if "position_ids" in kwargs and kwargs["position_ids"] is not None:
-                position_ids_list.append(kwargs["position_ids"].clone().detach().cpu())
+                position_ids_list.append(kwargs["position_ids"].clone().detach())
             return args, kwargs
 
         handle = self.model.language_model.register_forward_pre_hook(hook, with_kwargs=True)
