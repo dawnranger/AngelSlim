@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import time
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple
 
@@ -44,6 +45,71 @@ class Eagle3Trainer(Trainer, ABC):
         """
         super().__init__(model=draft_model, **kwargs)
         self.length = length
+        self._train_start_time = None
+        self._pending_log: dict = (
+            {}
+        )  # cache acc/ploss log for merging with base Trainer's loss log
+        self._pending_log_count: int = 0  # accumulated batch count for averaging the cached log
+
+    def train(self, *args, **kwargs):
+        """Override train method to record training start time for estimating remaining time."""
+        self._train_start_time = time.time()
+        return super().train(*args, **kwargs)
+
+    def log(self, logs: dict, start_time: Optional[float] = None) -> None:
+        """
+        rewrite log method to merge acc/ploss log with base Trainer's loss log.
+        """
+        if "loss" in logs and self._pending_log:
+            # merge cached acc/ploss data (average)
+            count = max(self._pending_log_count, 1)
+            acc_ploss = {k: f"{round(v / count, 3):.4f}" for k, v in self._pending_log.items()}
+            merged = {}
+
+            # step
+            if self.state is not None:
+                global_step = self.state.global_step
+                max_steps = self.state.max_steps
+                merged["step"] = f"{global_step:>5}"
+
+            # epoch
+            if "epoch" in logs:
+                merged["epoch"] = f"{logs['epoch']:.4f}"
+
+            # loss
+            if "loss" in logs:
+                merged["loss"] = f"{logs['loss']:.6f}"
+
+            # grad_norm (6 decimal places)
+            if "grad_norm" in logs:
+                merged["grad_norm"] = f"{logs['grad_norm']:.6f}"
+
+            # learning_rate (scientific notation, 6 decimal places)
+            if "learning_rate" in logs:
+                merged["lr"] = f"{logs['learning_rate']:.6e}"
+
+            # acc/ploss
+            merged.update(acc_ploss)
+
+            # remaining_time
+            if (
+                self.state is not None
+                and self._train_start_time is not None
+                and global_step > 0
+                and max_steps > 0
+            ):
+                elapsed = time.time() - self._train_start_time
+                time_per_step = elapsed / global_step
+                remaining_seconds = int(time_per_step * (max_steps - global_step))
+                hours, remainder = divmod(remaining_seconds, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                merged["remaining_time"] = f"{hours:02d}h:{minutes:02d}m:{seconds:02d}s"
+
+            self._pending_log.clear()
+            self._pending_log_count = 0
+            super().log(merged, start_time)
+        else:
+            super().log(logs, start_time)
 
     @property
     def draft_model(self) -> nn.Module:
@@ -214,15 +280,12 @@ class Eagle3Trainer(Trainer, ABC):
         ploss_weight = [0.8**i for i in range(len(plosses))]
         ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
 
-        log = {f"{log_prefix}/acc_{i}": round(float(acces[i]), 3) for i in range(len(acces))}
-        log.update(
-            {
-                f"{log_prefix}/ploss_{i}": round(float(plosses[i].item()), 3)
-                for i in range(len(plosses))
-            }
-        )
-        self.log(log)
-
+        log = {f"{log_prefix}/acc_{i}": acces[i] for i in range(len(acces))}
+        log.update({f"{log_prefix}/ploss_{i}": plosses[i].item() for i in range(len(plosses))})
+        # Cache log for merging with base Trainer's loss log
+        for k, v in log.items():
+            self._pending_log[k] = self._pending_log.get(k, 0.0) + v
+        self._pending_log_count += 1
         # Step 9: Return loss
         return ploss
 
