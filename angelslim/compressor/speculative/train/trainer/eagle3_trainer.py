@@ -63,30 +63,26 @@ class Eagle3Trainer(Trainer, ABC):
         if "loss" in logs and self._pending_log:
             # merge cached acc/ploss data (average)
             count = max(self._pending_log_count, 1)
-            acc_ploss = {k: f"{round(v / count, 3):.4f}" for k, v in self._pending_log.items()}
+            acc_ploss = {k: v / count for k, v in self._pending_log.items()}
             merged = {}
 
             # step
+            max_steps = 0
             if self.state is not None:
                 global_step = self.state.global_step
                 max_steps = self.state.max_steps
-                merged["step"] = f"{global_step:>5}"
+                merged["step"] = global_step
 
             # epoch
             if "epoch" in logs:
-                merged["epoch"] = f"{logs['epoch']:.4f}"
-
-            # loss
+                merged["epoch"] = logs["epoch"]
             if "loss" in logs:
-                merged["loss"] = f"{logs['loss']:.6f}"
-
-            # grad_norm (6 decimal places)
+                merged["loss"] = logs["loss"]
             if "grad_norm" in logs:
-                merged["grad_norm"] = f"{logs['grad_norm']:.6f}"
+                merged["grad_norm"] = logs["grad_norm"]
 
-            # learning_rate (scientific notation, 6 decimal places)
             if "learning_rate" in logs:
-                merged["lr"] = f"{logs['learning_rate']:.6e}"
+                merged["lr"] = logs["learning_rate"]
 
             # acc/ploss
             merged.update(acc_ploss)
