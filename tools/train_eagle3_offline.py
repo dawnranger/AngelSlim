@@ -26,6 +26,7 @@ from angelslim.compressor.speculative import (
     TargetHead,
     create_draft_model,
     get_supported_chat_template_type_strings,
+    infer_model_params,
 )
 from angelslim.utils import rank0_print
 
@@ -85,14 +86,24 @@ def parse_args():
     model_group.add_argument(
         "--lm_head_key",
         type=str,
-        default="lm_head.weight",
-        help="Key for lm head in model config",
+        default=None,
+        help=(
+            "Key for lm head in model config. you can find it in model.safetensors.index.json. "
+            "If not specified, will be auto deduced from target_model's model_type. "
+            "Examples: lm_head.weight (default LLM), model.embed_tokens.weight (HunyuanOCR), "
+            "model.language_model.embed_tokens.weight (Qwen3-VL)"
+        ),
     )
     model_group.add_argument(
         "--embed_weight_key",
         type=str,
-        default="model.embed_tokens.weight",
-        help="Key for embedding weights in model config",
+        default=None,
+        help=(
+            "Key for embedding weights in model config. "
+            "If not specified, will be auto deduced from target_model's model_type. "
+            "Examples: model.embed_tokens.weight (default LLM/HunyuanOCR), "
+            "model.language_model.embed_tokens.weight (Qwen3-VL)"
+        ),
     )
     model_group.add_argument(
         "--sub_config_name",
@@ -131,9 +142,10 @@ def parse_args():
     data_group.add_argument(
         "--chat_template_type",
         type=str,
-        default="qwen3",
+        default=None,
         help=(
-            f"Chat template type for conversation formatting. "
+            "Chat template type for conversation formatting. "
+            "If not specified, will be auto deduced from target_model's model_type. "
             f"Supported types: {', '.join(get_supported_chat_template_type_strings())}"
         ),
     )
@@ -275,6 +287,32 @@ def parse_args():
 
 def train():
     args = parse_args()
+
+    inferred_lm_head_key, inferred_embed_weight_key, inferred_chat_template_type = (
+        infer_model_params(args.target_model_name_or_path)
+    )
+    if args.lm_head_key is None:
+        if inferred_lm_head_key is None:
+            raise ValueError("lm_head_key not specified and cannot be auto deduced")
+        else:
+            args.lm_head_key = inferred_lm_head_key
+            rank0_print(f"lm_head_key not specified, auto deduced: {args.lm_head_key}")
+
+    if args.embed_weight_key is None:
+        if inferred_embed_weight_key is None:
+            raise ValueError("embed_weight_key not specified and cannot be auto deduced")
+        else:
+            args.embed_weight_key = inferred_embed_weight_key
+            rank0_print(f"embed_weight_key not specified, auto deduced: {args.embed_weight_key}")
+
+    if args.chat_template_type is None:
+        if inferred_chat_template_type is None:
+            raise ValueError("chat_template_type not specified and cannot be auto deduced")
+        else:
+            args.chat_template_type = inferred_chat_template_type
+            rank0_print(
+                f"chat_template_type not specified, auto deduced: {args.chat_template_type}"
+            )
 
     # Create draft model
     rank0_print("Loading draft model...")

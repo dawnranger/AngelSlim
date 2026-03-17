@@ -25,7 +25,11 @@ import torch.distributed as dist
 from tqdm import tqdm
 from transformers.image_utils import load_image
 
-from angelslim.compressor.speculative import DatasetManager, create_target_model
+from angelslim.compressor.speculative import (
+    DatasetManager,
+    create_target_model,
+    infer_model_params,
+)
 from angelslim.utils import decide_device_for_distributed
 
 # Configure logging
@@ -299,7 +303,10 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--model_max_length", type=int, default=2048, help="Maximum token length")
     parser.add_argument(
-        "--chat_template_type", type=str, default="default", help="Chat template type"
+        "--chat_template_type",
+        type=str,
+        default=None,
+        help="Chat template type (auto-detected from model config if not specified)",
     )
     parser.add_argument(
         "--display",
@@ -443,6 +450,24 @@ def main():
     args.eval_data_path = args.dataset_path
 
     try:
+        model_path = args.target_model_name_or_path or args.model_name
+        if args.chat_template_type is None:
+            _, _, inferred_chat_template_type = infer_model_params(model_path)
+            args.chat_template_type = (
+                inferred_chat_template_type
+                if inferred_chat_template_type is not None
+                else "default"
+            )
+            logger.info(
+                f"chat_template_type not specified, auto deduced: {args.chat_template_type}",
+                extra={"rank": rank},
+            )
+        else:
+            logger.info(
+                f"Using user-specified chat_template_type: {args.chat_template_type}",
+                extra={"rank": rank},
+            )
+
         # Load target model
         torch_dtype = get_torch_dtype(args.torch_dtype)
         target_model = create_target_model(
