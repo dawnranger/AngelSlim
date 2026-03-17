@@ -115,19 +115,6 @@ def parse_args():
     # Data arguments
     data_group = parser.add_argument_group("Data Arguments")
     data_group.add_argument(
-        "--train_data_path",
-        type=str,
-        nargs="+",
-        required=True,
-        help="Path to training data file(s) (JSON format). Can specify multiple files.",
-    )
-    data_group.add_argument(
-        "--eval_data_path",
-        type=str,
-        default=None,
-        help="Path to evaluation data file",
-    )
-    data_group.add_argument(
         "--train_hidden_path",
         type=str,
         required=True,
@@ -360,10 +347,8 @@ def train():
     (
         offline_train_dataset,
         offline_eval_dataset,
-        online_train_dataset,
-        online_eval_dataset,
         data_collator,
-    ) = dataset_manager.create_all_datasets()
+    ) = dataset_manager.create_offline_datasets()
 
     rank0_print(
         f"Offline train dataset size: {len(offline_train_dataset)}, "
@@ -371,19 +356,15 @@ def train():
         f"{len(offline_eval_dataset) if offline_eval_dataset else 0}"
     )
 
-    # Build vocabulary mapping for draft model using online training dataset
-    rank0_print("Building vocabulary mapping for draft model...")
-    if online_train_dataset is not None:
-        cache_path = os.path.join(args.output_dir, "vocab_mapping_cache.pt")
-        draft_model.build_vocab_mapping(
-            dataset=online_train_dataset,
-            cache_path=cache_path,
-        )
-        rank0_print("Vocabulary mapping built successfully")
+    # Build vocabulary mapping for draft model from pre-computed vocab mapping
+    rank0_print("Loading vocabulary mapping for draft model...")
+    vocab_mapping_path = os.path.join(args.train_hidden_path, "vocab_mapping.pt")
+    if os.path.exists(vocab_mapping_path):
+        rank0_print(f"Loading vocab mapping from {vocab_mapping_path}...")
+        draft_model.load_vocab_mapping(vocab_mapping_path=vocab_mapping_path)
+        rank0_print("Vocabulary mapping loaded successfully")
     else:
-        rank0_print(
-            "Warning: No online training dataset available, " "skipping vocab mapping build"
-        )
+        raise ValueError(f"vocab_mapping.pt not found at {vocab_mapping_path}")
 
     # Create a TrainingArguments object for the trainer
     # Organize training arguments by category

@@ -98,7 +98,8 @@ bash scripts/speculative/qwen3_vl/generate_vlm_hidden_for_draft_model.sh
 在使用前，需要在脚本中配置以下参数：
 
 - `DATASET_PATH`: 输入数据集的HF名称或本地路径
-- `MODEL_NAME`: 目标模型的HF名称或本地路径
+- `TARGET_MODEL_NAME_OR_PATH`: 目标模型的HF名称或本地路径
+- `DRAFT_MODEL_CONFIG_PATH`: 草稿模型的config路径
 - `TARGET_BACKEND`: 目标模型后端，目前仅支持HF
 - `MODEL_MAX_LENGTH`: 生成数据的上下文长度
 - `CHAT_TEMPLATE_TYPE`: 目标模型的目标类型，目前支持qwen3_vl/hunyuan_vl
@@ -151,7 +152,6 @@ bash scripts/speculative/qwen3_vl/train_eagle3_vlm_offline.sh
 
 - `TARGET_MODEL_NAME_OR_PATH`: 目标模型的HF名称或本地名称
 - `DRAFT_MODEL_CONFIG_PATH`: 草稿模型的config路径
-- `TRAIN_DATA_PATH`: 训练数据路径,.jsonl格式
 - `TRAIN_HIDDEN_PATH`: 训练hidden states数据路径
 - `EVAL_HIDDEN_PATH`: 验证hidden states数据路径
 - `OUTPUT_DIR`: Eagle3模型输出路径
