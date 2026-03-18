@@ -444,6 +444,12 @@ def train():
         trainer.train()
     rank0_print("Training completed!")
 
+    # Save final model to output_dir
+    rank0_print(f"Saving final model to {training_args.output_dir}...")
+    trainer.save_model()
+    trainer.save_state()
+    rank0_print("Final model saved successfully!")
+
 
 if __name__ == "__main__":
     train()
