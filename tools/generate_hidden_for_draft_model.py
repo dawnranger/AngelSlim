@@ -336,7 +336,7 @@ def parse_arguments() -> argparse.Namespace:
         "--target_backend",
         type=str,
         default="hf",
-        choices=["hf"],
+        choices=["hf", "vllm"],
         help="Backend for target model",
     )
     parser.add_argument(

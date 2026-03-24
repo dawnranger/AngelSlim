@@ -108,7 +108,7 @@ class BaseBackend(ABC):
         Selects three representative layers: early, middle, and late in the model.
 
         Args:
-            total_layers: Total number of hidden state layers (including embedding)
+            total_layers: Total number of decoder layers (excluding embedding)
 
         Returns:
             List of three layer indices [low, mid, high]
@@ -497,6 +497,384 @@ class VLMTransformersBackend(BaseBackend):
         }
 
 
+class VLMVLLMBackend(BaseBackend):
+    """VLM vLLM backend, use vLLM for inference and extract hidden states.
+
+    Register forward hook on vLLM model's language_model to capture
+    inputs_embeds and position_ids, and extract hidden states via apply_model.
+
+    Supported model types:
+        - qwen3_vl: Qwen3-VL series vision-language models
+        - hunyuan_vl: HunYuan-VL series vision-language models
+    """
+
+    SUPPORT_MODEL_TYPE = ["qwen3_vl", "hunyuan_vl"]
+
+    def load_model(self) -> None:
+        """Load VLM model using vLLM."""
+        from vllm import LLM
+
+        if self.target_model_type is None or self.target_model_type not in self.SUPPORT_MODEL_TYPE:
+            raise ValueError(
+                f"{self.target_model_type} is not supported. "
+                f"Supported types: {self.SUPPORT_MODEL_TYPE}"
+            )
+
+        # Extract vllm-related parameters from kwargs
+        tp_size = self.kwargs.get("tensor_parallel_size", 1)
+        max_model_len = self.kwargs.get("max_model_len", 8192)
+        gpu_memory_utilization = self.kwargs.get("gpu_memory_utilization", 0.9)
+        enforce_eager = self.kwargs.get("enforce_eager", True)
+        max_num_seqs = self.kwargs.get("max_num_seqs", 8)
+        distributed_executor_backend = self.kwargs.get("distributed_executor_backend", "mp")
+        limit_mm_per_prompt = self.kwargs.get("limit_mm_per_prompt", {"image": 10, "video": 10})
+
+        print_with_rank(f"Loading VLM model with vLLM backend: {self.model_path}")
+        print_with_rank(f"  tensor_parallel_size={tp_size}, max_model_len={max_model_len}")
+
+        self.model = LLM(
+            model=self.model_path,
+            tensor_parallel_size=tp_size,
+            max_model_len=max_model_len,
+            gpu_memory_utilization=gpu_memory_utilization,
+            enforce_eager=enforce_eager,
+            max_num_seqs=max_num_seqs,
+            distributed_executor_backend=distributed_executor_backend,
+            trust_remote_code=True,
+            limit_mm_per_prompt=limit_mm_per_prompt,
+        )
+        self.tokenizer = self.model.get_tokenizer()
+
+    def _get_language_model_module_name(self) -> str:
+        """Return the language model sub-module name based on model type."""
+        if self.target_model_type == "qwen3_vl":
+            return "language_model"
+        elif self.target_model_type == "hunyuan_vl":
+            return "model"
+        else:
+            raise ValueError(f"Unsupported target model type: {self.target_model_type}")
+
+    def _build_vllm_inputs(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        **kwargs,
+    ) -> list:
+        """Convert batched tensor inputs to a vLLM PromptType list.
+
+        vLLM does not accept batched tensor inputs; each sample must be
+        converted to an independent prompt dict.
+
+        Args:
+            input_ids: shape [batch_size, seq_len]
+            attention_mask: shape [batch_size, seq_len], used to determine valid length
+            **kwargs: may contain pixel_values, image_grid_thw, and other multimodal inputs
+
+        Returns:
+            List of vLLM PromptType, one element per sample
+        """
+        from vllm import TokensPrompt
+
+        batch_size = input_ids.shape[0]
+        pixel_values = kwargs.get("pixel_values", None)
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+
+        prompts = []
+        for i in range(batch_size):
+            # Truncate to valid tokens based on attention_mask
+            if attention_mask is not None:
+                valid_len = int(attention_mask[i].sum().item())
+                ids = input_ids[i, :valid_len].tolist()
+            else:
+                ids = input_ids[i].tolist()
+
+            prompt: dict = {"prompt_token_ids": ids}
+
+            # Attach multimodal data
+            if pixel_values is not None:
+                pv = pixel_values[i]
+                # Squeeze leading batch dimension if present (align with VLMTransformersBackend)
+                if isinstance(pv, torch.Tensor) and pv.dim() > 3:
+                    pv = pv.squeeze(0)
+                mm_data = {"image": pv}
+                if image_grid_thw is not None:
+                    # image_grid_thw: [num_images, 3], take the row for the current sample
+                    mm_data["image_grid_thw"] = image_grid_thw[i : i + 1]
+                prompt["multi_modal_data"] = mm_data
+
+            prompts.append(TokensPrompt(**prompt))
+
+        return prompts
+
+    def get_hidden_states_and_logits(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, ...]:
+        """get hidden states and logits from vLLM backend.
+
+        Args:
+            input_ids: shape [batch_size, seq_len]
+            attention_mask: shape [batch_size, seq_len]
+            **kwargs: pixel_values, image_grid_thw, aux_hidden_states_layer_ids
+
+        Returns:
+            Tuple of (hidden_states, logits, inputs_embeds, position_ids)
+        """
+        raise NotImplementedError(
+            "get_hidden_states_and_logits is not implemented for VLMVLLMBackend. "
+            "Please use get_aux_and_target_hiddens instead."
+        )
+
+    def get_aux_and_target_hiddens(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> dict:
+        """Extract auxiliary and target hidden states using the vLLM backend.
+
+        Registers forward hooks inside vLLM workers via apply_model, stores the
+        collected hidden states as a temporary attribute on the model, then reads
+        and cleans up the data after inference via a second apply_model call.
+
+        Note: This method requires vLLM to run with enforce_eager=True (no CUDA
+        graph) so that forward hooks fire correctly.
+
+        Args:
+            input_ids: Input token IDs, shape [batch_size, seq_len]
+            attention_mask: Attention mask, shape [batch_size, seq_len]
+            **kwargs: May contain:
+                - pixel_values: image pixel values
+                - image_grid_thw: image grid dimensions
+                - aux_hidden_states_layer_ids: list of auxiliary layer indices
+
+        Returns:
+            dict containing:
+                - hidden_states: concatenated auxiliary hidden states,
+                  shape [batch_size, seq_len, hidden_size * 3]
+                - target_hiddens: final-layer hidden states,
+                  shape [batch_size, seq_len, hidden_size]
+                - inputs_embeds: input embeddings,
+                  shape [batch_size, seq_len, hidden_size]
+                - position_ids: position encoding IDs
+        """
+        lm_module_name = self._get_language_model_module_name()
+        aux_layer_ids = kwargs.get("aux_hidden_states_layer_ids", None)
+        # Temporary attribute name used to store hook data inside the worker
+        _CACHE_ATTR = "_vlm_vllm_hook_cache"
+
+        def setup_hooks_fn(model):
+            """Register hooks inside the vLLM worker and store data as a model attribute.
+
+            When TP > 1, each worker only holds a hidden_size / TP slice.
+            We use dist.all_gather inside the worker to merge slices before storing.
+            Only the TP rank-0 worker stores the complete data; others store None.
+            """
+            import torch.distributed as worker_dist
+
+            handles = []
+            # Initialise cache
+            setattr(
+                model,
+                _CACHE_ATTR,
+                {
+                    "all_hidden_states": [],
+                    "inputs_embeds": None,
+                    "position_ids": None,
+                },
+            )
+            cache = getattr(model, _CACHE_ATTR)
+
+            # Determine whether this worker is TP rank 0 (responsible for storing complete data)
+            tp_rank = 0
+            if worker_dist.is_initialized():
+                tp_rank = worker_dist.get_rank()
+
+            def _all_gather_hidden(hidden: torch.Tensor) -> torch.Tensor:
+                """All-gather hidden states within the TP group, concatenating on the last dim.
+
+                TP splits hidden_size evenly across ranks; after all_gather we
+                concatenate along dim=-1 to restore the full hidden states.
+                """
+                if not worker_dist.is_initialized() or worker_dist.get_world_size() <= 1:
+                    return hidden
+                world_size = worker_dist.get_world_size()
+                # hidden: [batch, seq_len, hidden_size_per_tp]
+                gathered = [torch.empty_like(hidden) for _ in range(world_size)]
+                worker_dist.all_gather(gathered, hidden)
+                # Concatenate along the last dimension to restore full hidden_size
+                return torch.cat(gathered, dim=-1)
+
+            # Retrieve the language model sub-module
+            lm = getattr(model, lm_module_name, None)
+            if lm is None:
+                raise AttributeError(
+                    f"Model does not have attribute '{lm_module_name}'. "
+                    f"Available attributes: {list(model.__dict__.keys())}"
+                )
+
+            # Hook 1: capture inputs_embeds and position_ids
+            def pre_hook(module, args, hook_kwargs):
+                if "inputs_embeds" in hook_kwargs and hook_kwargs["inputs_embeds"] is not None:
+                    embeds = hook_kwargs["inputs_embeds"].clone().detach()
+                    # When TP > 1, inputs_embeds is also split along hidden_size; all_gather needed
+                    embeds = _all_gather_hidden(embeds)
+                    if tp_rank == 0:
+                        cache["inputs_embeds"] = embeds.cpu()
+                if "position_ids" in hook_kwargs and hook_kwargs["position_ids"] is not None:
+                    # position_ids is not split along hidden_size; all ranks hold identical data
+                    if tp_rank == 0:
+                        cache["position_ids"] = hook_kwargs["position_ids"].clone().detach().cpu()
+                return args, hook_kwargs
+
+            h = lm.register_forward_pre_hook(pre_hook, with_kwargs=True)
+            handles.append(h)
+
+            # Hook 2: register a post-hook on each decoder layer to collect hidden states
+            layers = None
+            for attr in ["layers", "decoder_layers", "h", "blocks"]:
+                layers = getattr(lm, attr, None)
+                if layers is not None:
+                    break
+            # If lm itself has no layers attribute, try lm.model
+            if layers is None and hasattr(lm, "model"):
+                for attr in ["layers", "decoder_layers", "h", "blocks"]:
+                    layers = getattr(lm.model, attr, None)
+                    if layers is not None:
+                        break
+
+            if layers is not None:
+                cache["all_hidden_states"] = [None] * len(layers)
+
+                for layer_idx, layer in enumerate(layers):
+
+                    def make_layer_hook(idx):
+                        def layer_hook(module, args, output):
+                            hidden = output[0] if isinstance(output, tuple) else output
+                            hidden = hidden.clone().detach()
+                            # TP > 1: all_gather to merge hidden_size slices from each rank
+                            hidden = _all_gather_hidden(hidden)
+                            # Only TP rank 0 stores the complete data
+                            if tp_rank == 0:
+                                cache["all_hidden_states"][idx] = hidden.cpu()
+                            return output
+
+                        return layer_hook
+
+                    h = layer.register_forward_hook(make_layer_hook(layer_idx))
+                    handles.append(h)
+
+            # Store handles in cache for later cleanup
+            cache["_handles"] = handles
+            return True
+
+        def collect_and_cleanup_fn(model):
+            """Read hook data from the model's temporary attribute and clean up."""
+            cache = getattr(model, _CACHE_ATTR, None)
+            if cache is None:
+                return None
+            # Remove all hooks
+            for h in cache.get("_handles", []):
+                h.remove()
+            # Read collected data
+            result = {
+                "all_hidden_states": cache["all_hidden_states"],
+                "inputs_embeds": cache["inputs_embeds"],
+                "position_ids": cache["position_ids"],
+            }
+            # Clean up temporary attribute
+            delattr(model, _CACHE_ATTR)
+            return result
+
+        # Register hooks inside the worker; include in try-finally so that
+        # partially-registered hooks are always cleaned up on failure.
+        try:
+            self.model.apply_model(setup_hooks_fn)
+
+            # Build vLLM inputs
+            prompts = self._build_vllm_inputs(input_ids, attention_mask, **kwargs)
+
+            # Run inference (vLLM internally triggers the hooks)
+            from vllm import SamplingParams
+
+            sampling_params = SamplingParams(
+                temperature=0,
+                max_tokens=1,
+                logprobs=0,
+            )
+            _ = self.model.generate(prompts, sampling_params=sampling_params)
+
+        finally:
+            # Read data from the worker and clean up hooks
+            worker_results = self.model.apply_model(collect_and_cleanup_fn)
+
+        # apply_model returns a list of results, one per worker.
+        # When TP > 1, only the TP rank-0 worker holds complete data
+        # (other workers have None elements in all_hidden_states).
+        # Pick the first result whose all_hidden_states contains non-None entries.
+        collected = None
+        for result in worker_results:
+            if (
+                result is not None
+                and result.get("all_hidden_states")
+                and any(h is not None for h in result["all_hidden_states"])
+            ):
+                collected = result
+                break
+
+        if collected is None:
+            raise RuntimeError(
+                "Failed to collect hidden states from vLLM model. "
+                "apply_model returned no valid results."
+            )
+
+        all_hs = collected["all_hidden_states"]
+        inputs_embeds = collected["inputs_embeds"]
+        position_ids = collected["position_ids"]
+
+        if not all_hs or all(h is None for h in all_hs):
+            raise RuntimeError(
+                "Failed to collect hidden states from vLLM model. "
+                "Please check that the model architecture is supported and "
+                "enforce_eager=True is set."
+            )
+
+        # Determine auxiliary layer indices
+        if aux_layer_ids is None:
+            num_layers = len(all_hs)
+            aux_layer_ids = self._get_default_aux_layer_ids(num_layers)
+
+        # Extract and concatenate auxiliary-layer hidden states
+        selected_hiddens = [all_hs[layer_id] for layer_id in aux_layer_ids]
+        aux_hidden_states = torch.cat(selected_hiddens, dim=-1)
+
+        # Final-layer hidden states
+        target_hidden_states = all_hs[-1]
+
+        # Handle position_ids for hunyuan_vl (take the first dimension)
+        if self.target_model_type == "hunyuan_vl" and position_ids is not None:
+            if position_ids.dim() == 3:
+                position_ids = position_ids[:, 0, :]
+
+        # Move results to the same device as input_ids
+        device = input_ids.device
+        aux_hidden_states = aux_hidden_states.to(device)
+        target_hidden_states = target_hidden_states.to(device)
+        if inputs_embeds is not None:
+            inputs_embeds = inputs_embeds.to(device)
+        if position_ids is not None:
+            position_ids = position_ids.to(device)
+
+        return {
+            "hidden_states": aux_hidden_states,
+            "target_hiddens": target_hidden_states,
+            "inputs_embeds": inputs_embeds,
+            "position_ids": position_ids,
+        }
+
+
 class AudioTransformersBackend(BaseBackend):
     """Audio HuggingFace Transformers backend"""
 
@@ -768,6 +1146,7 @@ class TargetModelWrapper:
         ("hf", "VLM"): VLMTransformersBackend,
         ("hf", "TTS"): TTSTransformersBackend,
         ("hf", "Audio"): AudioTransformersBackend,
+        ("vllm", "VLM"): VLMVLLMBackend,
     }
 
     def __init__(
@@ -879,6 +1258,7 @@ def create_target_model(
     torch_dtype: torch.dtype = torch.bfloat16,
     trust_remote_code: bool = True,
     target_model_type: str = None,
+    modal_type: str = "LLM",
     **extra_kwargs,
 ) -> TargetModelWrapper:
     """
@@ -888,10 +1268,12 @@ def create_target_model(
     with commonly used default settings.
 
     Args:
-        backend: Backend type, one of ["hf"]
+        backend: Backend type, one of ["hf", "vllm"]
         model_path: Path to model checkpoint or serving endpoint URL
         torch_dtype: Data type for model weights (for HF backend)
         trust_remote_code: Whether to trust and execute remote code
+        target_model_type: Specific model type, e.g. "qwen3_vl", "hunyuan_vl"
+        modal_type: Modal type, one of ["LLM", "VLM", "TTS", "Audio"]
         **extra_kwargs: Additional backend-specific arguments
 
     Returns:
@@ -916,6 +1298,9 @@ def create_target_model(
     # Add backend-specific configuration
     if backend == "hf":
         kwargs["torch_dtype"] = torch_dtype
+    elif backend == "vllm":
+        # vllm backend does not use the torch_dtype parameter; other extra_kwargs are kept
+        pass
     else:
         raise ValueError(
             f"Unsupported backend: '{backend}'. "
@@ -925,6 +1310,7 @@ def create_target_model(
     return TargetModelWrapper(
         backend=backend,
         model_path=model_path,
+        modal_type=modal_type,
         target_model_type=target_model_type,
         **kwargs,
     )
