@@ -89,7 +89,7 @@ class OnlineVLMDatasetBuilder(OnlineDatasetBuilder):
             display,
         )
         _max_pixels = os.environ.get("MAX_PIXELS")
-        _min_pixels = os.environ.get("MIN_PIXELS")
+        _min_pixels = os.environ.get("MIN_PIXELS", "1024")
         self.max_pixels = int(_max_pixels) if _max_pixels is not None else None
         self.min_pixels = int(_min_pixels) if _min_pixels is not None else None
         rank0_print(f"max_pixels: {self.max_pixels}, min_pixels: {self.min_pixels}")
@@ -348,7 +348,7 @@ class OnlineVLMHunyuanVLDatasetBuilder(OnlineDatasetBuilder):
             display,
         )
         _max_pixels = os.environ.get("MAX_PIXELS")
-        _min_pixels = os.environ.get("MIN_PIXELS")
+        _min_pixels = os.environ.get("MIN_PIXELS", "1024")
         self.max_pixels = int(_max_pixels) if _max_pixels is not None else None
         self.min_pixels = int(_min_pixels) if _min_pixels is not None else None
         rank0_print(f"max_pixels: {self.max_pixels}, min_pixels: {self.min_pixels}")

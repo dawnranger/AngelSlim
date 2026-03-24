@@ -104,7 +104,7 @@ class HiddenStateGenerator:
         self.draft_vocab_size = draft_vocab_size
         self.target_vocab_size = target_vocab_size
         _max_pixels = os.environ.get("MAX_PIXELS")
-        _min_pixels = os.environ.get("MIN_PIXELS")
+        _min_pixels = os.environ.get("MIN_PIXELS", "1024")
         self.max_pixels = int(_max_pixels) if _max_pixels is not None else None
         self.min_pixels = int(_min_pixels) if _min_pixels is not None else None
         self.output_dir.mkdir(parents=True, exist_ok=True)
