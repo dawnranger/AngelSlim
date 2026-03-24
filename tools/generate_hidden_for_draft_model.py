@@ -157,8 +157,8 @@ class HiddenStateGenerator:
                     else:
                         vision_encoding = processor(images=images, return_tensors="pt")
                     row["pixel_values"] = vision_encoding["pixel_values"].to(device)
-                    if "video_pixel_values" in vision_encoding:
-                        row["video_pixel_values"] = vision_encoding["video_pixel_values"].to(
+                    if "pixel_values_videos" in vision_encoding:
+                        row["pixel_values_videos"] = vision_encoding["pixel_values_videos"].to(
                             device
                         )
                     if "image_grid_thw" in vision_encoding:

@@ -283,7 +283,7 @@ class TransformersBackend(BaseBackend):
 class VLMTransformersBackend(BaseBackend):
     """VLM HuggingFace Transformers backend"""
 
-    SUPPORT_MODEL_TYPE = ["hunyuan_vl", "qwen3_vl"]
+    SUPPORT_MODEL_TYPE = ["hunyuan_vl", "qwen3_vl", "qwen2.5_vl"]
 
     def load_model(self):
         if self.target_model_type is None or self.target_model_type not in self.SUPPORT_MODEL_TYPE:
@@ -305,7 +305,7 @@ class VLMTransformersBackend(BaseBackend):
 
             # Load processor
             self.tokenizer = AutoProcessor.from_pretrained(self.model_path, trust_remote_code=True)
-        elif self.target_model_type == "qwen3_vl":
+        elif self.target_model_type in ("qwen3_vl", "qwen2.5_vl"):
             from transformers import AutoModelForImageTextToText, AutoProcessor
 
             device = decide_device_for_distributed()
@@ -375,7 +375,7 @@ class VLMTransformersBackend(BaseBackend):
                 position_ids_list.append(kwargs["position_ids"].clone().detach())
             return args, kwargs
 
-        if self.target_model_type == "qwen3_vl":
+        if self.target_model_type in ("qwen3_vl", "qwen2.5_vl"):
             handle = self.model.language_model.register_forward_pre_hook(hook, with_kwargs=True)
         elif self.target_model_type == "hunyuan_vl":
             handle = self.model.model.register_forward_pre_hook(hook, with_kwargs=True)
@@ -445,7 +445,7 @@ class VLMTransformersBackend(BaseBackend):
                 position_ids_list.append(kwargs["position_ids"].clone().detach())
             return args, kwargs
 
-        if self.target_model_type == "qwen3_vl":
+        if self.target_model_type in ("qwen3_vl", "qwen2.5_vl"):
             handle = self.model.language_model.register_forward_pre_hook(hook, with_kwargs=True)
         elif self.target_model_type == "hunyuan_vl":
             handle = self.model.model.register_forward_pre_hook(hook, with_kwargs=True)
@@ -505,10 +505,11 @@ class VLMVLLMBackend(BaseBackend):
 
     Supported model types:
         - qwen3_vl: Qwen3-VL series vision-language models
+        - qwen2.5_vl: Qwen2.5-VL series vision-language models
         - hunyuan_vl: HunYuan-VL series vision-language models
     """
 
-    SUPPORT_MODEL_TYPE = ["qwen3_vl", "hunyuan_vl"]
+    SUPPORT_MODEL_TYPE = ["qwen3_vl", "qwen2.5_vl", "hunyuan_vl"]
 
     def load_model(self) -> None:
         """Load VLM model using vLLM."""
@@ -547,7 +548,7 @@ class VLMVLLMBackend(BaseBackend):
 
     def _get_language_model_module_name(self) -> str:
         """Return the language model sub-module name based on model type."""
-        if self.target_model_type == "qwen3_vl":
+        if self.target_model_type in ("qwen3_vl", "qwen2.5_vl"):
             return "language_model"
         elif self.target_model_type == "hunyuan_vl":
             return "model"
@@ -568,7 +569,8 @@ class VLMVLLMBackend(BaseBackend):
         Args:
             input_ids: shape [batch_size, seq_len]
             attention_mask: shape [batch_size, seq_len], used to determine valid length
-            **kwargs: may contain pixel_values, image_grid_thw, and other multimodal inputs
+            **kwargs: may contain pixel_values, image_grid_thw,
+                pixel_values_videos, video_grid_thw, and other multimodal inputs
 
         Returns:
             List of vLLM PromptType, one element per sample
@@ -578,6 +580,8 @@ class VLMVLLMBackend(BaseBackend):
         batch_size = input_ids.shape[0]
         pixel_values = kwargs.get("pixel_values", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
+        pixel_values_videos = kwargs.get("pixel_values_videos", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
 
         prompts = []
         for i in range(batch_size):
@@ -590,16 +594,29 @@ class VLMVLLMBackend(BaseBackend):
 
             prompt: dict = {"prompt_token_ids": ids}
 
-            # Attach multimodal data
+            # Attach multimodal data (image and/or video)
+            mm_data = {}
             if pixel_values is not None:
                 pv = pixel_values[i]
                 # Squeeze leading batch dimension if present (align with VLMTransformersBackend)
                 if isinstance(pv, torch.Tensor) and pv.dim() > 3:
                     pv = pv.squeeze(0)
-                mm_data = {"image": pv}
+                mm_data["image"] = pv
                 if image_grid_thw is not None:
                     # image_grid_thw: [num_images, 3], take the row for the current sample
                     mm_data["image_grid_thw"] = image_grid_thw[i : i + 1]
+
+            if pixel_values_videos is not None:
+                vpv = pixel_values_videos[i]
+                # Squeeze leading batch dimension if present
+                if isinstance(vpv, torch.Tensor) and vpv.dim() > 3:
+                    vpv = vpv.squeeze(0)
+                mm_data["video"] = vpv
+                if video_grid_thw is not None:
+                    # video_grid_thw: [num_videos, 3], take the row for the current sample
+                    mm_data["video_grid_thw"] = video_grid_thw[i : i + 1]
+
+            if mm_data:
                 prompt["multi_modal_data"] = mm_data
 
             prompts.append(TokensPrompt(**prompt))
