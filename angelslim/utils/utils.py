@@ -275,8 +275,14 @@ def decide_device_for_distributed():
 
     # Determine device based on distributed info
     if local_rank >= 0:
-        # torchrun with LOCAL_RANK
-        device = f"cuda:{local_rank}"
+        # torchrun with LOCAL_RANK.
+        # When CUDA_VISIBLE_DEVICES has been set to pin a single GPU
+        # (e.g. in setup_distributed), the only visible device is cuda:0
+        # even though LOCAL_RANK may be > 0.  Clamp to avoid an
+        # "invalid device ordinal" error.
+        num_visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        device_idx = local_rank if local_rank < num_visible else 0
+        device = f"cuda:{device_idx}"
     elif rank >= 0:
         # Distributed initialized without LOCAL_RANK
         device = f"cuda:{rank}"

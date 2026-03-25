@@ -512,7 +512,15 @@ class VLMVLLMBackend(BaseBackend):
     SUPPORT_MODEL_TYPE = ["qwen3_vl", "qwen2.5_vl", "hunyuan_vl"]
 
     def load_model(self) -> None:
-        """Load VLM model using vLLM."""
+        """Load VLM model using vLLM.
+
+        Only supported in Ray actor or standalone (non-torchrun) environments.
+        Ray actor processes do not have torchrun environment variables;
+        CUDA_VISIBLE_DEVICES is managed by Ray automatically, and vLLM
+        can freely use NCCL to create process groups without any conflicts.
+
+        For torchrun-based VLM inference, use VLMTransformersBackend instead.
+        """
         from vllm import LLM
 
         if self.target_model_type is None or self.target_model_type not in self.SUPPORT_MODEL_TYPE:
@@ -523,15 +531,87 @@ class VLMVLLMBackend(BaseBackend):
 
         # Extract vllm-related parameters from kwargs
         tp_size = self.kwargs.get("tensor_parallel_size", 1)
+        self.tp_size = (
+            tp_size  # Save TP size for hook functions to decide whether all_gather is needed
+        )
         max_model_len = self.kwargs.get("max_model_len", 8192)
         gpu_memory_utilization = self.kwargs.get("gpu_memory_utilization", 0.9)
+        print_with_rank(f"gpu_memory_utilization: {gpu_memory_utilization}")
         enforce_eager = self.kwargs.get("enforce_eager", True)
         max_num_seqs = self.kwargs.get("max_num_seqs", 8)
-        distributed_executor_backend = self.kwargs.get("distributed_executor_backend", "mp")
         limit_mm_per_prompt = self.kwargs.get("limit_mm_per_prompt", {"image": 10, "video": 10})
+        print_with_rank(f"limit_mm_per_prompt: {limit_mm_per_prompt}")
+
+        if tp_size > 1:
+            distributed_executor_backend = self.kwargs.get("distributed_executor_backend", "mp")
+        else:
+            distributed_executor_backend = self.kwargs.get("distributed_executor_backend", None)
+
+        # apply_model() passes closure functions (setup_hooks_fn, collect_and_cleanup_fn)
+        # to the vLLM EngineCore subprocess. vLLM's default safe serializer cannot
+        # handle `function` objects, so we enable pickle-based fallback serialization.
+        os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
+        # Load AutoProcessor WITHOUT initializing CUDA in the actor process.
+        # When running inside a Ray actor, the actor's CUDA_VISIBLE_DEVICES
+        # points to a single GPU. If AutoProcessor (or any transitive import)
+        # triggers CUDA initialization, it will:
+        #   1. Occupy ~1-2 GiB VRAM in the actor (parent) process
+        #   2. Force vLLM's EngineCore to use 'spawn' mode
+        #   3. The EngineCore subprocess will see reduced free memory
+        # Temporarily hiding CUDA devices prevents this.
+        _saved_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        try:
+            from transformers import AutoProcessor
+
+            self.tokenizer = AutoProcessor.from_pretrained(
+                self.model_path,
+                trust_remote_code=True,
+            )
+        finally:
+            # Restore CUDA_VISIBLE_DEVICES so that vLLM's LLM() can find the GPU
+            if _saved_cuda_visible is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = _saved_cuda_visible
+            else:
+                del os.environ["CUDA_VISIBLE_DEVICES"]
+
+        # Read MAX_PIXELS / MIN_PIXELS from environment so that vLLM's
+        # internal image processor uses the same resize parameters as
+        # online_dataset_builder's _process_single_conversation.  This ensures
+        # the number of image_pad tokens expanded by vLLM matches the
+        # expectation from the preprocessed loss_mask.
+        #
+        # Different model families require different kwarg formats:
+        #   - Qwen2.5-VL: max_pixels / min_pixels
+        #   - Qwen3-VL:   size={"longest_edge": ..., "shortest_edge": ...}
+        # We use build_image_processor_kwargs() to handle this automatically.
+        _max_pixels = os.environ.get("MAX_PIXELS")
+        _min_pixels = os.environ.get("MIN_PIXELS", "1024")
+        _max_pixels = int(_max_pixels) if _max_pixels is not None else None
+        _min_pixels = int(_min_pixels) if _min_pixels is not None else None
+        print_with_rank(f"_max_pixels: {_max_pixels}, _min_pixels: {_min_pixels}")
+        mm_processor_kwargs = {}
+        if _max_pixels is not None or _min_pixels is not None:
+            from angelslim.compressor.speculative.train.data.data_utils import (
+                build_image_processor_kwargs,
+            )
+
+            # self.tokenizer is an AutoProcessor loaded above, which contains
+            # image_processor; use it to determine the correct kwarg format.
+            mm_processor_kwargs = build_image_processor_kwargs(
+                self.tokenizer.image_processor,
+                max_pixels=_max_pixels,
+                min_pixels=_min_pixels,
+            )
 
         print_with_rank(f"Loading VLM model with vLLM backend: {self.model_path}")
-        print_with_rank(f"  tensor_parallel_size={tp_size}, max_model_len={max_model_len}")
+        print_with_rank(
+            f"  tensor_parallel_size={tp_size}, max_model_len={max_model_len}, "
+            f"distributed_executor_backend={distributed_executor_backend}"
+        )
+        if mm_processor_kwargs:
+            print_with_rank(f"  mm_processor_kwargs={mm_processor_kwargs}")
 
         self.model = LLM(
             model=self.model_path,
@@ -543,8 +623,14 @@ class VLMVLLMBackend(BaseBackend):
             distributed_executor_backend=distributed_executor_backend,
             trust_remote_code=True,
             limit_mm_per_prompt=limit_mm_per_prompt,
+            mm_processor_kwargs=mm_processor_kwargs or None,
         )
-        self.tokenizer = self.model.get_tokenizer()
+        # Use AutoProcessor instead of vLLM's get_tokenizer() so that
+        # HiddenStateGenerator._process_single_sample can access
+        # processor.image_processor for image preprocessing.
+        # vLLM's get_tokenizer() returns a plain text tokenizer without
+        # image_processor, causing "You need to specify either `text` or
+        # `text_target`" errors when processing VLM image samples.
 
     def _get_language_model_module_name(self) -> str:
         """Return the language model sub-module name based on model type."""
@@ -554,6 +640,42 @@ class VLMVLLMBackend(BaseBackend):
             return "model"
         else:
             raise ValueError(f"Unsupported target model type: {self.target_model_type}")
+
+    @staticmethod
+    def _collapse_consecutive_image_pad(ids: list, image_pad_token_id: int) -> list:
+        """Collapse runs of consecutive image_pad tokens into a single token.
+
+        online_dataset_builder._process_single_conversation expands each
+        <|image_pad|> placeholder into N consecutive image_pad tokens based on
+        the image's pixel count.  vLLM, however, expects only **one**
+        image_pad token per image and performs its own expansion internally
+        via _apply_prompt_updates.  If we pass the already-expanded N tokens,
+        vLLM replaces only the first one and leaves N-1 stale tokens in the
+        prompt, corrupting the sequence length.
+
+        This helper compresses each consecutive run of image_pad tokens back
+        to a single token so that vLLM can expand it correctly.
+
+        Args:
+            ids: list of token ids (already valid-length truncated)
+            image_pad_token_id: the integer token id for <|image_pad|>
+
+        Returns:
+            New list with consecutive image_pad runs collapsed to one token.
+        """
+        if image_pad_token_id not in ids:
+            return ids
+        collapsed: list = []
+        prev_is_pad = False
+        for tok in ids:
+            if tok == image_pad_token_id:
+                if not prev_is_pad:
+                    collapsed.append(tok)
+                prev_is_pad = True
+            else:
+                collapsed.append(tok)
+                prev_is_pad = False
+        return collapsed
 
     def _build_vllm_inputs(
         self,
@@ -566,11 +688,27 @@ class VLMVLLMBackend(BaseBackend):
         vLLM does not accept batched tensor inputs; each sample must be
         converted to an independent prompt dict.
 
+        vLLM's multi_modal_data only accepts the following modality keys:
+        "audio", "image", "video", "vision_chunk".  Metadata tensors such as
+        image_grid_thw / video_grid_thw must NOT be placed as top-level keys;
+        vLLM's internal processor will compute them automatically from the
+        raw images / videos.
+
+        **Important**: When images are present, the input_ids from
+        _process_single_conversation contain N consecutive image_pad tokens
+        per image (pre-expanded for HF Transformers backend).  vLLM expects
+        only **one** image_pad token per image and will expand it internally.
+        This method collapses consecutive image_pad tokens before passing to
+        vLLM.
+
         Args:
             input_ids: shape [batch_size, seq_len]
             attention_mask: shape [batch_size, seq_len], used to determine valid length
-            **kwargs: may contain pixel_values, image_grid_thw,
-                pixel_values_videos, video_grid_thw, and other multimodal inputs
+            **kwargs: may contain:
+                - raw_images: list of PIL Image lists (one list per sample)
+                - raw_videos: list of video data (one per sample)
+                - pixel_values, pixel_values_videos: pre-processed tensors
+                  (used only when raw images/videos are not available)
 
         Returns:
             List of vLLM PromptType, one element per sample
@@ -578,10 +716,20 @@ class VLMVLLMBackend(BaseBackend):
         from vllm import TokensPrompt
 
         batch_size = input_ids.shape[0]
-        pixel_values = kwargs.get("pixel_values", None)
-        image_grid_thw = kwargs.get("image_grid_thw", None)
-        pixel_values_videos = kwargs.get("pixel_values_videos", None)
-        video_grid_thw = kwargs.get("video_grid_thw", None)
+        raw_images = kwargs.get("raw_images", None)
+        raw_videos = kwargs.get("raw_videos", None)
+
+        # Resolve image_pad token id for collapsing consecutive runs
+        image_pad_token_id = None
+        has_multimodal = (raw_images is not None and any(imgs for imgs in raw_images)) or (
+            raw_videos is not None and any(vids for vids in raw_videos)
+        )
+        if has_multimodal and self.tokenizer is not None:
+            # Qwen VL models: image_token attribute or fall back to tokenizer vocab
+            _image_token = getattr(self.tokenizer, "image_token", "<|image_pad|>")
+            _tok = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+            _vocab = _tok.get_vocab() if hasattr(_tok, "get_vocab") else {}
+            image_pad_token_id = _vocab.get(_image_token)
 
         prompts = []
         for i in range(batch_size):
@@ -592,29 +740,27 @@ class VLMVLLMBackend(BaseBackend):
             else:
                 ids = input_ids[i].tolist()
 
+            # Collapse consecutive image_pad tokens so vLLM can re-expand correctly
+            if image_pad_token_id is not None:
+                ids = self._collapse_consecutive_image_pad(ids, image_pad_token_id)
+
             prompt: dict = {"prompt_token_ids": ids}
 
             # Attach multimodal data (image and/or video)
+            # vLLM expects raw PIL Images (or ndarray), NOT pre-processed
+            # pixel_values tensors.  It will run its own image processor
+            # internally, which also computes image_grid_thw automatically.
             mm_data = {}
-            if pixel_values is not None:
-                pv = pixel_values[i]
-                # Squeeze leading batch dimension if present (align with VLMTransformersBackend)
-                if isinstance(pv, torch.Tensor) and pv.dim() > 3:
-                    pv = pv.squeeze(0)
-                mm_data["image"] = pv
-                if image_grid_thw is not None:
-                    # image_grid_thw: [num_images, 3], take the row for the current sample
-                    mm_data["image_grid_thw"] = image_grid_thw[i : i + 1]
+            if raw_images is not None and raw_images[i]:
+                images_for_sample = raw_images[i]
+                # vLLM accepts a single image or a list of images
+                if len(images_for_sample) == 1:
+                    mm_data["image"] = images_for_sample[0]
+                else:
+                    mm_data["image"] = images_for_sample
 
-            if pixel_values_videos is not None:
-                vpv = pixel_values_videos[i]
-                # Squeeze leading batch dimension if present
-                if isinstance(vpv, torch.Tensor) and vpv.dim() > 3:
-                    vpv = vpv.squeeze(0)
-                mm_data["video"] = vpv
-                if video_grid_thw is not None:
-                    # video_grid_thw: [num_videos, 3], take the row for the current sample
-                    mm_data["video_grid_thw"] = video_grid_thw[i : i + 1]
+            if raw_videos is not None and raw_videos[i]:
+                mm_data["video"] = raw_videos[i]
 
             if mm_data:
                 prompt["multi_modal_data"] = mm_data
@@ -681,16 +827,17 @@ class VLMVLLMBackend(BaseBackend):
         aux_layer_ids = kwargs.get("aux_hidden_states_layer_ids", None)
         # Temporary attribute name used to store hook data inside the worker
         _CACHE_ATTR = "_vlm_vllm_hook_cache"
+        # TP size from model init, captured by setup_hooks_fn closure
+        _tp_size = getattr(self, "tp_size", 1)
 
         def setup_hooks_fn(model):
             """Register hooks inside the vLLM worker and store data as a model attribute.
 
             When TP > 1, each worker only holds a hidden_size / TP slice.
-            We use dist.all_gather inside the worker to merge slices before storing.
+            We use vLLM's TP-aware all_gather inside the worker to merge slices
+            before storing, avoiding conflicts with external torch.distributed.
             Only the TP rank-0 worker stores the complete data; others store None.
             """
-            import torch.distributed as worker_dist
-
             handles = []
             # Initialise cache
             setattr(
@@ -704,10 +851,20 @@ class VLMVLLMBackend(BaseBackend):
             )
             cache = getattr(model, _CACHE_ATTR)
 
-            # Determine whether this worker is TP rank 0 (responsible for storing complete data)
+            # Determine TP rank and world_size.
+            # Use vLLM's own parallel_state to avoid conflicts with external
+            # torch.distributed (which may belong to the training launcher).
+            # When TP=1 we skip all distributed calls entirely.
             tp_rank = 0
-            if worker_dist.is_initialized():
-                tp_rank = worker_dist.get_rank()
+            tp_world_size = _tp_size  # captured from outer scope (set before apply_model)
+            if tp_world_size > 1:
+                from vllm.distributed.parallel_state import (
+                    get_tensor_model_parallel_rank,
+                    get_tensor_model_parallel_world_size,
+                )
+
+                tp_rank = get_tensor_model_parallel_rank()
+                tp_world_size = get_tensor_model_parallel_world_size()
 
             def _all_gather_hidden(hidden: torch.Tensor) -> torch.Tensor:
                 """All-gather hidden states within the TP group, concatenating on the last dim.
@@ -715,12 +872,16 @@ class VLMVLLMBackend(BaseBackend):
                 TP splits hidden_size evenly across ranks; after all_gather we
                 concatenate along dim=-1 to restore the full hidden states.
                 """
-                if not worker_dist.is_initialized() or worker_dist.get_world_size() <= 1:
+                if tp_world_size <= 1:
                     return hidden
-                world_size = worker_dist.get_world_size()
+                import torch.distributed as worker_dist
+                from vllm.distributed.parallel_state import (
+                    get_tensor_model_parallel_group,
+                )
+
                 # hidden: [batch, seq_len, hidden_size_per_tp]
-                gathered = [torch.empty_like(hidden) for _ in range(world_size)]
-                worker_dist.all_gather(gathered, hidden)
+                gathered = [torch.empty_like(hidden) for _ in range(tp_world_size)]
+                worker_dist.all_gather(gathered, hidden, group=get_tensor_model_parallel_group())
                 # Concatenate along the last dimension to restore full hidden_size
                 return torch.cat(gathered, dim=-1)
 
