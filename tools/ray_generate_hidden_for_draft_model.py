@@ -241,19 +241,6 @@ def split_dataset_indices(total_len, num_workers, start=0, end=None):
 def main():
     args = parse_arguments()
 
-    # ==========================================
-    # Prevent the driver process from occupying GPU memory.
-    # The driver only needs CPU for data preprocessing; all GPU work is done
-    # inside Ray actor workers.  Without this, PyTorch may lazily initialize
-    # a CUDA context on GPU 0 when loading AutoProcessor, consuming several
-    # GiB of VRAM and causing the worker assigned to that GPU to fail with
-    # "Free memory ... is less than desired GPU memory utilization".
-    # We save the original value so Ray workers (spawned later) can still
-    # discover GPUs via Ray's own CUDA_VISIBLE_DEVICES management.
-    # ==========================================
-    _original_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
-
     # Auto-infer chat_template_type
     if args.chat_template_type is None:
         _, _, inferred_chat_template_type = infer_model_params(args.target_model_name_or_path)
@@ -320,12 +307,7 @@ def main():
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     # Force tqdm to print each progress update on a new line instead of using
-    # carriage return (\r) to overwrite in place.  When stdout/stderr is piped
-    # through `tee` (as in the shell launcher script), the stream is no longer
-    # a TTY and intermediate progress updates may be buffered / invisible.
-    # By monkey-patching tqdm's display method we ensure every update becomes
-    # a separate line, making progress visible in both the terminal and the
-    # log file.
+    # carriage return (\r) to overwrite in place.
     import tqdm as _tqdm_mod
 
     # _orig_display = _tqdm_mod.tqdm.display
@@ -376,13 +358,6 @@ def main():
     # so they can import HiddenStateGenerator from generate_hidden_for_draft_model.
     tools_dir = os.path.dirname(os.path.abspath(__file__))
     os.environ["_RAY_TOOLS_DIR"] = tools_dir
-
-    # Restore CUDA_VISIBLE_DEVICES before ray.init() so that Ray can
-    # correctly detect GPU resources on this node.
-    if _original_cuda_visible is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = _original_cuda_visible
-    else:
-        del os.environ["CUDA_VISIBLE_DEVICES"]
 
     ray.init(ignore_reinit_error=True)
     logger.info(f"Ray initialized, available resources: {ray.available_resources()}")

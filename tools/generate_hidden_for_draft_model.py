@@ -57,28 +57,8 @@ def setup_distributed():
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ["LOCAL_RANK"])
-
-        # Pin each torchrun process to its GPU(s) **before** any CUDA call.
-        # CUDA_VISIBLE_DEVICES is only effective before the CUDA context is
-        # initialised.  Setting it here ensures that both the torchrun NCCL
-        # backend and any downstream framework (e.g. vLLM) use the correct
-        # physical GPU(s).
-        #
-        # GPUS_PER_PROC (default 1) controls how many GPUs each torchrun
-        # process should see.  When using vLLM with TP > 1, set
-        # GPUS_PER_PROC=<tp_size> and nproc_per_node=<total_gpus / tp_size>
-        # so that each process can see <tp_size> consecutive GPUs.
-        gpus_per_proc = int(os.environ.get("GPUS_PER_PROC", "1"))
-        start_gpu = local_rank * gpus_per_proc
-        visible_gpus = ",".join(str(start_gpu + i) for i in range(gpus_per_proc))
-        os.environ["CUDA_VISIBLE_DEVICES"] = visible_gpus
-
-        # Initialize process group
         dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))
-        # After CUDA_VISIBLE_DEVICES pinning, the first visible device is
-        # cuda:0 which corresponds to physical GPU <start_gpu>.
-        torch.cuda.set_device(0)
-
+        torch.cuda.set_device(local_rank)
         return rank, world_size, local_rank
     else:
         # Single process mode

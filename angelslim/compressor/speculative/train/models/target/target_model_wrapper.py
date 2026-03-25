@@ -552,40 +552,13 @@ class VLMVLLMBackend(BaseBackend):
         # handle `function` objects, so we enable pickle-based fallback serialization.
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
-        # Load AutoProcessor WITHOUT initializing CUDA in the actor process.
-        # When running inside a Ray actor, the actor's CUDA_VISIBLE_DEVICES
-        # points to a single GPU. If AutoProcessor (or any transitive import)
-        # triggers CUDA initialization, it will:
-        #   1. Occupy ~1-2 GiB VRAM in the actor (parent) process
-        #   2. Force vLLM's EngineCore to use 'spawn' mode
-        #   3. The EngineCore subprocess will see reduced free memory
-        # Temporarily hiding CUDA devices prevents this.
-        _saved_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
-        try:
-            from transformers import AutoProcessor
+        from transformers import AutoProcessor
 
-            self.tokenizer = AutoProcessor.from_pretrained(
-                self.model_path,
-                trust_remote_code=True,
-            )
-        finally:
-            # Restore CUDA_VISIBLE_DEVICES so that vLLM's LLM() can find the GPU
-            if _saved_cuda_visible is not None:
-                os.environ["CUDA_VISIBLE_DEVICES"] = _saved_cuda_visible
-            else:
-                del os.environ["CUDA_VISIBLE_DEVICES"]
+        self.tokenizer = AutoProcessor.from_pretrained(
+            self.model_path,
+            trust_remote_code=True,
+        )
 
-        # Read MAX_PIXELS / MIN_PIXELS from environment so that vLLM's
-        # internal image processor uses the same resize parameters as
-        # online_dataset_builder's _process_single_conversation.  This ensures
-        # the number of image_pad tokens expanded by vLLM matches the
-        # expectation from the preprocessed loss_mask.
-        #
-        # Different model families require different kwarg formats:
-        #   - Qwen2.5-VL: max_pixels / min_pixels
-        #   - Qwen3-VL:   size={"longest_edge": ..., "shortest_edge": ...}
-        # We use build_image_processor_kwargs() to handle this automatically.
         _max_pixels = os.environ.get("MAX_PIXELS")
         _min_pixels = os.environ.get("MIN_PIXELS", "1024")
         _max_pixels = int(_max_pixels) if _max_pixels is not None else None
@@ -597,8 +570,6 @@ class VLMVLLMBackend(BaseBackend):
                 build_image_processor_kwargs,
             )
 
-            # self.tokenizer is an AutoProcessor loaded above, which contains
-            # image_processor; use it to determine the correct kwarg format.
             mm_processor_kwargs = build_image_processor_kwargs(
                 self.tokenizer.image_processor,
                 max_pixels=_max_pixels,
@@ -625,12 +596,6 @@ class VLMVLLMBackend(BaseBackend):
             limit_mm_per_prompt=limit_mm_per_prompt,
             mm_processor_kwargs=mm_processor_kwargs or None,
         )
-        # Use AutoProcessor instead of vLLM's get_tokenizer() so that
-        # HiddenStateGenerator._process_single_sample can access
-        # processor.image_processor for image preprocessing.
-        # vLLM's get_tokenizer() returns a plain text tokenizer without
-        # image_processor, causing "You need to specify either `text` or
-        # `text_target`" errors when processing VLM image samples.
 
     def _get_language_model_module_name(self) -> str:
         """Return the language model sub-module name based on model type."""
