@@ -152,9 +152,31 @@ class MRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        if self.rope_type == "default":
+            # Standard RoPE: no scaling, equivalent to _compute_default_rope_parameters
+            # In transformers>=5.x, rope_theta is merged into rope_scaling/rope_parameters dict,
+            # so we need to check there first, then fallback to config attribute.
+            rope_scaling = getattr(config, "rope_scaling", None) or {}
+            base = rope_scaling.get("rope_theta", None) or getattr(config, "rope_theta", 10000.0)
+            partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+            head_dim = (
+                getattr(config, "head_dim", None)
+                or config.hidden_size // config.num_attention_heads
+            )
+            dim = int(head_dim * partial_rotary_factor)
+            inv_freq = 1.0 / (
+                base
+                ** (
+                    torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float)
+                    / dim
+                )
+            )
+            self.attention_scaling = 1.0
+        else:
+            self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+            inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
 
