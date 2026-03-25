@@ -161,13 +161,21 @@ class PTQVLMSaveVllmHF(PTQSaveBase):
         else:
             quantization_config["activation_scheme"] = "dynamic" if is_dynamic else "static"
 
+        if (
+            hasattr(self.quant_model.quant_config, "transform_config")
+            and self.quant_model.quant_config.transform_config is not None
+        ):
+            quantization_config["transform_config"] = (
+                self.quant_model.quant_config.transform_config
+            )
+
         quant_dict = {"quantization_config": quantization_config}
         self.quant_model.get_model().config.update(quant_dict)
         print_info("Save quantization_config: {}".format(quant_dict))
 
         os.makedirs(save_path, exist_ok=True)
 
-        self.quant_model.get_model().save_pretrained(save_path)
+        self.quant_model.get_model().save_pretrained(save_path, max_shard_size="5GB")
         self.quant_model.processor.save_pretrained(save_path)
         self.quant_model.tokenizer.save_pretrained(save_path)
 
@@ -260,12 +268,20 @@ class PTQSaveVllmHF(PTQSaveBase):
         else:
             quantization_config["activation_scheme"] = "dynamic" if is_dynamic else "static"
 
+        if (
+            hasattr(self.quant_model.quant_config, "transform_config")
+            and self.quant_model.quant_config.transform_config is not None
+        ):
+            quantization_config["transform_config"] = (
+                self.quant_model.quant_config.transform_config
+            )
+
         quant_dict = {"quantization_config": quantization_config}
         self.quant_model.get_model().config.update(quant_dict)
         print_info("Save quantization_config: {}".format(quant_dict))
 
         os.makedirs(save_path, exist_ok=True)
-        self.quant_model.get_model().save_pretrained(save_path)
+        self.quant_model.get_model().save_pretrained(save_path, max_shard_size="5GB")
 
         with open(os.path.join(save_path, "hf_quant_config.json"), "w") as f:
             json.dump(trtllm_config, f, indent=4)
@@ -836,6 +852,7 @@ class DeepSeekV3PTQSaveMulti(PTQSaveBase):
                 substring in param_name
                 for substring in self.quant_model.quant_config.quant_algo_info["ignore_layers"]
             ):
+
                 if param_name.endswith("weight_scale_inv"):
                     return
                 weight_scale = scales_dict.get(f"{param_name}_scale", None)
