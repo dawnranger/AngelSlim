@@ -859,6 +859,11 @@ class VLMVLLMBackend(BaseBackend):
                 )
 
             # Hook 1: capture inputs_embeds and position_ids
+            # NOTE: In vLLM, the VLM's forward() calls language_model.model(...)
+            # directly, bypassing language_model.forward(). So we must register
+            # the pre_hook on lm.model (the actual decoder model) rather than lm
+            # (the CausalLM wrapper). Also, vLLM uses "positions" as the kwarg
+            # name instead of "position_ids".
             def pre_hook(module, args, hook_kwargs):
                 if "inputs_embeds" in hook_kwargs and hook_kwargs["inputs_embeds"] is not None:
                     embeds = hook_kwargs["inputs_embeds"].clone().detach()
@@ -866,13 +871,22 @@ class VLMVLLMBackend(BaseBackend):
                     embeds = _all_gather_hidden(embeds)
                     if tp_rank == 0:
                         cache["inputs_embeds"] = embeds.cpu()
+                # vLLM uses "positions" (not "position_ids") as the kwarg name
+                pos_key = None
                 if "position_ids" in hook_kwargs and hook_kwargs["position_ids"] is not None:
+                    pos_key = "position_ids"
+                elif "positions" in hook_kwargs and hook_kwargs["positions"] is not None:
+                    pos_key = "positions"
+                if pos_key is not None:
                     # position_ids is not split along hidden_size; all ranks hold identical data
                     if tp_rank == 0:
-                        cache["position_ids"] = hook_kwargs["position_ids"].clone().detach().cpu()
+                        cache["position_ids"] = hook_kwargs[pos_key].clone().detach().cpu()
                 return args, hook_kwargs
 
-            h = lm.register_forward_pre_hook(pre_hook, with_kwargs=True)
+            # Register pre_hook on the inner model (lm.model) if it exists,
+            # because vLLM's VLM forward() calls lm.model(...) directly.
+            pre_hook_target = getattr(lm, "model", lm)
+            h = pre_hook_target.register_forward_pre_hook(pre_hook, with_kwargs=True)
             handles.append(h)
 
             # Hook 2: register a post-hook on each decoder layer to collect hidden states
@@ -995,6 +1009,17 @@ class VLMVLLMBackend(BaseBackend):
 
         # Final-layer hidden states
         target_hidden_states = all_hs[-1]
+
+        # vLLM internally uses packed/flattened format, so hook-captured hidden
+        # states are 2D (seq_len, hidden_size) without a batch dimension.
+        # Add batch dimension to match the expected (B, N, D) format used by
+        # the rest of the pipeline (data collator, trainer, etc.).
+        if aux_hidden_states.dim() == 2:
+            aux_hidden_states = aux_hidden_states.unsqueeze(0)
+        if target_hidden_states.dim() == 2:
+            target_hidden_states = target_hidden_states.unsqueeze(0)
+        if inputs_embeds is not None and inputs_embeds.dim() == 2:
+            inputs_embeds = inputs_embeds.unsqueeze(0)
 
         # Handle position_ids for hunyuan_vl (take the first dimension)
         if self.target_model_type == "hunyuan_vl" and position_ids is not None:

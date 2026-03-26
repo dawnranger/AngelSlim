@@ -248,8 +248,10 @@ class VLMDataCollatorWithPadding:
                        e.g. {"max_pixels": 1003520, "min_pixels": 200704}.
         """
         self.processor = processor
+        if image_processor_kwargs is None:
+            image_processor_kwargs = {}
         max_pixels = image_processor_kwargs.get("max_pixels", None)
-        min_pixels = image_processor_kwargs.get("min_pixels", None)
+        min_pixels = image_processor_kwargs.get("min_pixels", "1024")
         if (
             processor is not None
             and (max_pixels is not None or min_pixels is not None)
@@ -375,8 +377,10 @@ class VLMHunyuanDataCollatorWithPadding:
                        e.g. {"max_pixels": 1003520, "min_pixels": 200704}.
         """
         self.processor = processor
+        if image_processor_kwargs is None:
+            image_processor_kwargs = {}
         max_pixels = image_processor_kwargs.get("max_pixels", None)
-        min_pixels = image_processor_kwargs.get("min_pixels", None)
+        min_pixels = image_processor_kwargs.get("min_pixels", "1024")
         if (
             processor is not None
             and (max_pixels is not None or min_pixels is not None)
