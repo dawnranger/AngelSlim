@@ -82,6 +82,12 @@ def parse_args():
     parser.add_argument("--temp", type=float, default=0, help="Number of speculative tokens")
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--output_len", type=int, default=1024)
+    parser.add_argument(
+        "--limit_mm_per_prompt_image",
+        type=int,
+        default=1,
+        help="Maximum number of images per prompt",
+    )
     return parser.parse_args()
 
 
@@ -232,7 +238,7 @@ def main():
         enforce_eager=True,
         disable_log_stats=False,
         max_model_len=args.max_model_len,
-        limit_mm_per_prompt={"image": 1},
+        limit_mm_per_prompt={"image": args.limit_mm_per_prompt_image},
         disable_chunked_mm_input=False,
     )
 

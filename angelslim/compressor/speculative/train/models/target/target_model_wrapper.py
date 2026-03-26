@@ -877,10 +877,23 @@ class VLMVLLMBackend(BaseBackend):
                     pos_key = "position_ids"
                 elif "positions" in hook_kwargs and hook_kwargs["positions"] is not None:
                     pos_key = "positions"
+
+                pos_tensor = None
                 if pos_key is not None:
-                    # position_ids is not split along hidden_size; all ranks hold identical data
-                    if tp_rank == 0:
-                        cache["position_ids"] = hook_kwargs[pos_key].clone().detach().cpu()
+                    pos_tensor = hook_kwargs[pos_key]
+                elif len(args) >= 2 and args[1] is not None:
+                    if isinstance(args[1], torch.Tensor):
+                        pos_tensor = args[1]
+
+                if pos_tensor is not None and tp_rank == 0:
+                    # Only keep the longest positions (from prefill, not decode).
+                    # vLLM calls model.forward multiple times: prefill (full seq)
+                    # then decode (1 token at a time). We want the prefill positions.
+                    new_len = pos_tensor.shape[-1]
+                    old_pos = cache["position_ids"]
+                    old_len = old_pos.shape[-1] if old_pos is not None else 0
+                    if new_len > old_len:
+                        cache["position_ids"] = pos_tensor.clone().detach().cpu()
                 return args, hook_kwargs
 
             # Register pre_hook on the inner model (lm.model) if it exists,
@@ -932,12 +945,51 @@ class VLMVLLMBackend(BaseBackend):
                             # Only TP rank 0 stores the complete data
                             if tp_rank == 0:
                                 cache["all_hidden_states"][idx] = hidden.cpu()
+
+                            # Capture positions from the first layer's input args.
+                            # In vLLM, DecoderLayer.forward(positions, hidden_states, residual)
+                            # receives positions as the first positional arg.
+                            # We capture from every layer (idx==0 is enough but we use
+                            # "keep longest" logic to handle chunked prefill).
+                            if idx == 0 and tp_rank == 0 and len(args) >= 1:
+                                pos_candidate = args[0]
+                                if isinstance(pos_candidate, torch.Tensor):
+                                    new_len = pos_candidate.shape[-1]
+                                    old_pos = cache["position_ids"]
+                                    old_len = old_pos.shape[-1] if old_pos is not None else 0
+                                    if new_len > old_len:
+                                        cache["position_ids"] = (
+                                            pos_candidate.clone().detach().cpu()
+                                        )
+
                             return output
 
                         return layer_hook
 
                     h = layer.register_forward_hook(make_layer_hook(layer_idx))
                     handles.append(h)
+
+                # Hook 3: register a pre-hook on the FIRST decoder layer to
+                # capture positions.  In vLLM, Qwen3LLMModel.forward() calls
+                # each layer as `layer(positions, hidden_states, residual)`,
+                # passing positions as the first positional arg.  The model-level
+                # pre_hook may fail to capture positions when they are passed as
+                # positional args (not kwargs) in certain vLLM code paths.
+                first_layer = layers[0]
+
+                def _first_layer_pre_hook(module, args, hook_kwargs):
+                    # positions is the first positional arg of DecoderLayer.forward
+                    if len(args) >= 1 and args[0] is not None:
+                        if isinstance(args[0], torch.Tensor) and tp_rank == 0:
+                            new_len = args[0].shape[-1]
+                            old_pos = cache["position_ids"]
+                            old_len = old_pos.shape[-1] if old_pos is not None else 0
+                            if new_len > old_len:
+                                cache["position_ids"] = args[0].clone().detach().cpu()
+                    return args, hook_kwargs
+
+                h = first_layer.register_forward_pre_hook(_first_layer_pre_hook, with_kwargs=True)
+                handles.append(h)
 
             # Store handles in cache for later cleanup
             cache["_handles"] = handles
@@ -1041,6 +1093,16 @@ class VLMVLLMBackend(BaseBackend):
         if self.target_model_type == "hunyuan_vl" and position_ids is not None:
             if position_ids.dim() == 3:
                 position_ids = position_ids[:, 0, :]
+
+        # For MRoPE models (e.g. Qwen3-VL), hook-captured position_ids have
+        # shape (3, num_tokens) without a batch dimension.  Add batch dim to
+        # get (3, 1, num_tokens) so the data collator can pad/stack correctly.
+        if position_ids is not None and position_ids.dim() == 2:
+            # Check if this is MRoPE format (first dim == 3) vs regular (B, N)
+            if position_ids.shape[0] == 3:
+                # MRoPE: (3, num_tokens) -> (3, 1, num_tokens)
+                position_ids = position_ids.unsqueeze(1)
+            # else: regular 2D (B, N), keep as-is
 
         # Move results to the same device as input_ids
         device = input_ids.device
