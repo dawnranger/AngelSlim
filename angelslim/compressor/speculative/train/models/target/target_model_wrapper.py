@@ -909,8 +909,24 @@ class VLMVLLMBackend(BaseBackend):
 
                     def make_layer_hook(idx):
                         def layer_hook(module, args, output):
-                            hidden = output[0] if isinstance(output, tuple) else output
-                            hidden = hidden.clone().detach()
+                            # vLLM decoder layers return (hidden_states, residual)
+                            # where hidden_states is the MLP output BEFORE adding
+                            # the residual.  To match HuggingFace Transformers'
+                            # output_hidden_states (which returns the full layer
+                            # output = hidden_states + residual), we must add them
+                            # together here.
+                            if isinstance(output, tuple) and len(output) == 2:
+                                hidden_states_out, residual_out = output
+                                if residual_out is not None:
+                                    hidden = (hidden_states_out + residual_out).clone().detach()
+                                else:
+                                    hidden = hidden_states_out.clone().detach()
+                            else:
+                                hidden = (
+                                    output.clone().detach()
+                                    if not isinstance(output, tuple)
+                                    else output[0].clone().detach()
+                                )
                             # TP > 1: all_gather to merge hidden_size slices from each rank
                             hidden = _all_gather_hidden(hidden)
                             # Only TP rank 0 stores the complete data
