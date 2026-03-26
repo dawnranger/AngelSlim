@@ -115,12 +115,12 @@ def apply_rotary_pos_emb_mrope(q, k, cos, sin, position_ids=None, unsqueeze_dim=
 # key: model_type (from AutoConfig)
 MODEL_TYPE_PARAM_MAP: dict = {
     "qwen3_vl": (
-        "model.language_model.embed_tokens.weight",
+        "lm_head.weight",
         "model.language_model.embed_tokens.weight",
         "qwen3_vl",
     ),
     "qwen3_vl_moe": (
-        "model.language_model.embed_tokens.weight",
+        "lm_head.weight",
         "model.language_model.embed_tokens.weight",
         "qwen3_vl",
     ),
@@ -170,10 +170,20 @@ def infer_model_params(
         print(f"[Auto-detect] Detected model_type: {model_type}")
         if model_type in MODEL_TYPE_PARAM_MAP:
             lm_head_key, embed_weight_key, chat_template_type = MODEL_TYPE_PARAM_MAP[model_type]
+            # compatible with tie_word_embeddings=False/True
+            tie_word_embeddings = getattr(config, "tie_word_embeddings", False)
+            if tie_word_embeddings and lm_head_key != embed_weight_key:
+                print(
+                    f"[Auto-detect] tie_word_embeddings=True, "
+                    f"overriding lm_head_key from '{lm_head_key}' to '{embed_weight_key}'"
+                )
+                lm_head_key = embed_weight_key
+
             print(
                 f"[Auto-detect] lm_head_key={lm_head_key}, "
                 f"embed_weight_key={embed_weight_key}, "
-                f"chat_template_type={chat_template_type}"
+                f"chat_template_type={chat_template_type}, "
+                f"tie_word_embeddings={tie_word_embeddings}"
             )
             return lm_head_key, embed_weight_key, chat_template_type
         else:
