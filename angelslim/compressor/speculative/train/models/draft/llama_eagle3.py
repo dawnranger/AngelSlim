@@ -342,9 +342,20 @@ class LlamaAttention(nn.Module):
         lck = len(cache_k)
 
         if lck == 1:
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query_states, k0, v0, attn_mask=attention_mask
-            )
+            # cuDNN SDPA backend (PyTorch 2.7+) does not support arbitrary 4D
+            # float attention masks and will fail during backward with:
+            #   "Expected mha_graph->execute(...).is_good() to be true"
+            # Disable cuDNN backend so that Flash Attention / math backends
+            # handle the 4D causal mask correctly.
+            _sdpa_backends = [
+                torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+                torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+                torch.nn.attention.SDPBackend.MATH,
+            ]
+            with torch.nn.attention.sdpa_kernel(_sdpa_backends):
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query_states, k0, v0, attn_mask=attention_mask
+                )
             attn_output = attn_output.transpose(1, 2).contiguous()
             attn_output = attn_output.reshape(bsz, q_len, -1)
             attn_output = self.o_proj(attn_output)
