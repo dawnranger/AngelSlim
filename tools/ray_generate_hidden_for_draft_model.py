@@ -254,6 +254,7 @@ def main():
     # Read draft model config
     draft_vocab_size = None
     target_vocab_size = None
+    logger.info(f"args.draft_model_config_path: {args.draft_model_config_path}")
     if args.draft_model_config_path is not None:
         draft_config = DraftModelConfig.from_file(args.draft_model_config_path)
         draft_vocab_size = getattr(draft_config, "draft_vocab_size", None)
