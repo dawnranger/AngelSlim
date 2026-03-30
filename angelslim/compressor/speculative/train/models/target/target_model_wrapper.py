@@ -1121,6 +1121,431 @@ class VLMVLLMBackend(BaseBackend):
         }
 
 
+class VLLMBackend(BaseBackend):
+    """LLM vLLM backend, use vLLM for inference and extract hidden states.
+
+    Register forward hooks on vLLM model to capture inputs_embeds,
+    position_ids, and extract hidden states from each decoder layer.
+
+    This backend is designed for pure text LLMs (not VLMs), where the
+    top-level model is a CausalLM (e.g. Qwen2ForCausalLM, Qwen3ForCausalLM)
+    with a `model` attribute containing the decoder layers.
+
+    Supported model types:
+        - qwen2.5: Qwen2.5 series text LLMs
+        - qwen3: Qwen3 series text LLMs
+    """
+
+    SUPPORT_MODEL_TYPE = ["qwen2.5", "qwen3"]
+
+    def load_model(self) -> None:
+        """Load LLM model using vLLM.
+
+        Only supported in Ray actor or standalone (non-torchrun) environments.
+        Ray actor processes do not have torchrun environment variables;
+        CUDA_VISIBLE_DEVICES is managed by Ray automatically, and vLLM
+        can freely use NCCL to create process groups without any conflicts.
+
+        For torchrun-based LLM inference, use TransformersBackend instead.
+        """
+        from vllm import LLM
+
+        if self.target_model_type is None or self.target_model_type not in self.SUPPORT_MODEL_TYPE:
+            raise ValueError(
+                f"{self.target_model_type} is not supported. "
+                f"Supported types: {self.SUPPORT_MODEL_TYPE}"
+            )
+
+        # Extract vllm-related parameters from kwargs
+        tp_size = self.kwargs.get("tensor_parallel_size", 1)
+        self.tp_size = tp_size
+        max_model_len = self.kwargs.get("max_model_len", 8192)
+        gpu_memory_utilization = self.kwargs.get("gpu_memory_utilization", 0.9)
+        print_with_rank(f"gpu_memory_utilization: {gpu_memory_utilization}")
+        enforce_eager = self.kwargs.get("enforce_eager", True)
+        max_num_seqs = self.kwargs.get("max_num_seqs", 8)
+
+        if tp_size > 1:
+            distributed_executor_backend = self.kwargs.get("distributed_executor_backend", "mp")
+        else:
+            distributed_executor_backend = self.kwargs.get("distributed_executor_backend", None)
+
+        # apply_model() passes closure functions to the vLLM EngineCore subprocess.
+        # vLLM's default safe serializer cannot handle `function` objects,
+        # so we enable pickle-based fallback serialization.
+        os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
+        from transformers import AutoTokenizer
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_path,
+            trust_remote_code=True,
+        )
+
+        print_with_rank(f"Loading LLM model with vLLM backend: {self.model_path}")
+        print_with_rank(
+            f"  tensor_parallel_size={tp_size}, max_model_len={max_model_len}, "
+            f"distributed_executor_backend={distributed_executor_backend}"
+        )
+
+        self.model = LLM(
+            model=self.model_path,
+            tensor_parallel_size=tp_size,
+            max_model_len=max_model_len,
+            gpu_memory_utilization=gpu_memory_utilization,
+            enforce_eager=enforce_eager,
+            max_num_seqs=max_num_seqs,
+            distributed_executor_backend=distributed_executor_backend,
+            trust_remote_code=True,
+        )
+
+    def _build_vllm_inputs(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> list:
+        """Convert batched tensor inputs to a vLLM TokensPrompt list.
+
+        Args:
+            input_ids: shape [batch_size, seq_len]
+            attention_mask: shape [batch_size, seq_len], used to determine valid length
+
+        Returns:
+            List of vLLM TokensPrompt, one element per sample
+        """
+        from vllm import TokensPrompt
+
+        batch_size = input_ids.shape[0]
+        prompts = []
+        for i in range(batch_size):
+            if attention_mask is not None:
+                valid_len = int(attention_mask[i].sum().item())
+                ids = input_ids[i, :valid_len].tolist()
+            else:
+                ids = input_ids[i].tolist()
+
+            prompts.append(TokensPrompt(prompt_token_ids=ids))
+
+        return prompts
+
+    def get_hidden_states_and_logits(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, ...]:
+        """get hidden states and logits from vLLM backend.
+
+        Args:
+            input_ids: shape [batch_size, seq_len]
+            attention_mask: shape [batch_size, seq_len]
+            **kwargs: aux_hidden_states_layer_ids
+
+        Returns:
+            Tuple of (hidden_states, logits)
+        """
+        raise NotImplementedError(
+            "get_hidden_states_and_logits is not implemented for VLLMBackend. "
+            "Please use get_aux_and_target_hiddens instead."
+        )
+
+    def get_aux_and_target_hiddens(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> dict:
+        """Extract auxiliary and target hidden states using the vLLM backend.
+
+        Registers forward hooks inside vLLM workers via apply_model, stores the
+        collected hidden states as a temporary attribute on the model, then reads
+        and cleans up the data after inference via a second apply_model call.
+
+        Note: This method requires vLLM to run with enforce_eager=True (no CUDA
+        graph) so that forward hooks fire correctly.
+
+        Args:
+            input_ids: Input token IDs, shape [batch_size, seq_len]
+            attention_mask: Attention mask, shape [batch_size, seq_len]
+            **kwargs: May contain:
+                - aux_hidden_states_layer_ids: list of auxiliary layer indices
+
+        Returns:
+            dict containing:
+                - hidden_states: concatenated auxiliary hidden states,
+                  shape [batch_size, seq_len, hidden_size * 3]
+                - target_hiddens: final-layer hidden states,
+                  shape [batch_size, seq_len, hidden_size]
+                - inputs_embeds: input embeddings,
+                  shape [batch_size, seq_len, hidden_size]
+                - position_ids: position encoding IDs
+        """
+        aux_layer_ids = kwargs.get("aux_hidden_states_layer_ids", None)
+        # Temporary attribute name used to store hook data inside the worker
+        _CACHE_ATTR = "_llm_vllm_hook_cache"
+        # TP size from model init, captured by setup_hooks_fn closure
+        _tp_size = getattr(self, "tp_size", 1)
+
+        def setup_hooks_fn(model):
+            """Register hooks inside the vLLM worker and store data as a model attribute.
+
+            For pure text LLMs (e.g. Qwen2ForCausalLM, Qwen3ForCausalLM),
+            the top-level model IS the CausalLM itself, with `model.model`
+            being the decoder model containing `layers`.
+
+            When TP > 1, each worker only holds a hidden_size / TP slice.
+            We use vLLM's TP-aware all_gather inside the worker to merge slices
+            before storing, avoiding conflicts with external torch.distributed.
+            Only the TP rank-0 worker stores the complete data; others store None.
+            """
+            handles = []
+            setattr(
+                model,
+                _CACHE_ATTR,
+                {
+                    "all_hidden_states": [],
+                    "inputs_embeds": None,
+                    "position_ids": None,
+                },
+            )
+            cache = getattr(model, _CACHE_ATTR)
+
+            tp_rank = 0
+            tp_world_size = _tp_size
+            if tp_world_size > 1:
+                from vllm.distributed.parallel_state import (
+                    get_tensor_model_parallel_rank,
+                    get_tensor_model_parallel_world_size,
+                )
+
+                tp_rank = get_tensor_model_parallel_rank()
+                tp_world_size = get_tensor_model_parallel_world_size()
+
+            def _all_gather_hidden(hidden: torch.Tensor) -> torch.Tensor:
+                """All-gather hidden states within the TP group."""
+                if tp_world_size <= 1:
+                    return hidden
+                import torch.distributed as worker_dist
+                from vllm.distributed.parallel_state import (
+                    get_tensor_model_parallel_group,
+                )
+
+                gathered = [torch.empty_like(hidden) for _ in range(tp_world_size)]
+                worker_dist.all_gather(gathered, hidden, group=get_tensor_model_parallel_group())
+                return torch.cat(gathered, dim=-1)
+
+            # For pure text LLMs, the model itself is the CausalLM.
+            # model.model is the decoder model (e.g. Qwen2Model, Qwen3Model).
+            inner_model = getattr(model, "model", None)
+            if inner_model is None:
+                raise AttributeError(
+                    f"Model does not have attribute 'model'. "
+                    f"Available attributes: {list(model.__dict__.keys())}"
+                )
+
+            # Hook 1: capture inputs_embeds and position_ids from the inner model
+            def pre_hook(module, args, hook_kwargs):
+                if "inputs_embeds" in hook_kwargs and hook_kwargs["inputs_embeds"] is not None:
+                    embeds = hook_kwargs["inputs_embeds"].clone().detach()
+                    embeds = _all_gather_hidden(embeds)
+                    if tp_rank == 0:
+                        cache["inputs_embeds"] = embeds.cpu()
+
+                pos_key = None
+                if "position_ids" in hook_kwargs and hook_kwargs["position_ids"] is not None:
+                    pos_key = "position_ids"
+                elif "positions" in hook_kwargs and hook_kwargs["positions"] is not None:
+                    pos_key = "positions"
+
+                pos_tensor = None
+                if pos_key is not None:
+                    pos_tensor = hook_kwargs[pos_key]
+                elif len(args) >= 2 and args[1] is not None:
+                    if isinstance(args[1], torch.Tensor):
+                        pos_tensor = args[1]
+
+                if pos_tensor is not None and tp_rank == 0:
+                    new_len = pos_tensor.shape[-1]
+                    old_pos = cache["position_ids"]
+                    old_len = old_pos.shape[-1] if old_pos is not None else 0
+                    if new_len > old_len:
+                        cache["position_ids"] = pos_tensor.clone().detach().cpu()
+                return args, hook_kwargs
+
+            h = inner_model.register_forward_pre_hook(pre_hook, with_kwargs=True)
+            handles.append(h)
+
+            # Hook 2: register a post-hook on each decoder layer to collect hidden states
+            layers = None
+            for attr in ["layers", "decoder_layers", "h", "blocks"]:
+                layers = getattr(inner_model, attr, None)
+                if layers is not None:
+                    break
+
+            if layers is not None:
+                cache["all_hidden_states"] = [None] * len(layers)
+
+                for layer_idx, layer in enumerate(layers):
+
+                    def make_layer_hook(idx):
+                        def layer_hook(module, args, output):
+                            # vLLM decoder layers return (hidden_states, residual)
+                            if isinstance(output, tuple) and len(output) == 2:
+                                hidden_states_out, residual_out = output
+                                if residual_out is not None:
+                                    hidden = (hidden_states_out + residual_out).clone().detach()
+                                else:
+                                    hidden = hidden_states_out.clone().detach()
+                            else:
+                                hidden = (
+                                    output.clone().detach()
+                                    if not isinstance(output, tuple)
+                                    else output[0].clone().detach()
+                                )
+                            hidden = _all_gather_hidden(hidden)
+                            if tp_rank == 0:
+                                cache["all_hidden_states"][idx] = hidden.cpu()
+
+                            # Capture positions from the first layer's input args
+                            if idx == 0 and tp_rank == 0 and len(args) >= 1:
+                                pos_candidate = args[0]
+                                if isinstance(pos_candidate, torch.Tensor):
+                                    new_len = pos_candidate.shape[-1]
+                                    old_pos = cache["position_ids"]
+                                    old_len = old_pos.shape[-1] if old_pos is not None else 0
+                                    if new_len > old_len:
+                                        cache["position_ids"] = (
+                                            pos_candidate.clone().detach().cpu()
+                                        )
+
+                            return output
+
+                        return layer_hook
+
+                    h = layer.register_forward_hook(make_layer_hook(layer_idx))
+                    handles.append(h)
+
+                # Hook 3: pre-hook on the first decoder layer to capture positions
+                first_layer = layers[0]
+
+                def _first_layer_pre_hook(module, args, hook_kwargs):
+                    if len(args) >= 1 and args[0] is not None:
+                        if isinstance(args[0], torch.Tensor) and tp_rank == 0:
+                            new_len = args[0].shape[-1]
+                            old_pos = cache["position_ids"]
+                            old_len = old_pos.shape[-1] if old_pos is not None else 0
+                            if new_len > old_len:
+                                cache["position_ids"] = args[0].clone().detach().cpu()
+                    return args, hook_kwargs
+
+                h = first_layer.register_forward_pre_hook(_first_layer_pre_hook, with_kwargs=True)
+                handles.append(h)
+
+            cache["_handles"] = handles
+            return True
+
+        def collect_and_cleanup_fn(model):
+            """Read hook data from the model's temporary attribute and clean up."""
+            cache = getattr(model, _CACHE_ATTR, None)
+            if cache is None:
+                return None
+            for h in cache.get("_handles", []):
+                h.remove()
+            result = {
+                "all_hidden_states": cache["all_hidden_states"],
+                "inputs_embeds": cache["inputs_embeds"],
+                "position_ids": cache["position_ids"],
+            }
+            delattr(model, _CACHE_ATTR)
+            return result
+
+        # Register hooks inside the worker
+        try:
+            self.model.apply_model(setup_hooks_fn)
+
+            # Build vLLM inputs (pure text, no multimodal data)
+            prompts = self._build_vllm_inputs(input_ids, attention_mask)
+
+            # Run inference (vLLM internally triggers the hooks)
+            from vllm import SamplingParams
+
+            sampling_params = SamplingParams(
+                temperature=0,
+                max_tokens=1,
+                logprobs=0,
+            )
+            _ = self.model.generate(prompts, sampling_params=sampling_params)
+
+        finally:
+            worker_results = self.model.apply_model(collect_and_cleanup_fn)
+
+        # Pick the first result whose all_hidden_states contains non-None entries
+        collected = None
+        for result in worker_results:
+            if (
+                result is not None
+                and result.get("all_hidden_states")
+                and any(h is not None for h in result["all_hidden_states"])
+            ):
+                collected = result
+                break
+
+        if collected is None:
+            raise RuntimeError(
+                "Failed to collect hidden states from vLLM model. "
+                "apply_model returned no valid results."
+            )
+
+        all_hs = collected["all_hidden_states"]
+        inputs_embeds = collected["inputs_embeds"]
+        position_ids = collected["position_ids"]
+
+        if not all_hs or all(h is None for h in all_hs):
+            raise RuntimeError(
+                "Failed to collect hidden states from vLLM model. "
+                "Please check that the model architecture is supported and "
+                "enforce_eager=True is set."
+            )
+
+        # Determine auxiliary layer indices
+        if aux_layer_ids is None:
+            num_layers = len(all_hs)
+            aux_layer_ids = self._get_default_aux_layer_ids(num_layers)
+
+        # Extract and concatenate auxiliary-layer hidden states
+        selected_hiddens = [all_hs[layer_id] for layer_id in aux_layer_ids]
+        aux_hidden_states = torch.cat(selected_hiddens, dim=-1)
+
+        # Final-layer hidden states
+        target_hidden_states = all_hs[-1]
+
+        # vLLM internally uses packed/flattened format, so hook-captured hidden
+        # states are 2D (seq_len, hidden_size) without a batch dimension.
+        # Add batch dimension to match the expected (B, N, D) format.
+        if aux_hidden_states.dim() == 2:
+            aux_hidden_states = aux_hidden_states.unsqueeze(0)
+        if target_hidden_states.dim() == 2:
+            target_hidden_states = target_hidden_states.unsqueeze(0)
+        if inputs_embeds is not None and inputs_embeds.dim() == 2:
+            inputs_embeds = inputs_embeds.unsqueeze(0)
+
+        # Move results to the same device as input_ids
+        device = input_ids.device
+        aux_hidden_states = aux_hidden_states.to(device)
+        target_hidden_states = target_hidden_states.to(device)
+        if inputs_embeds is not None:
+            inputs_embeds = inputs_embeds.to(device)
+        if position_ids is not None:
+            position_ids = position_ids.to(device)
+
+        return {
+            "hidden_states": aux_hidden_states,
+            "target_hiddens": target_hidden_states,
+            "inputs_embeds": inputs_embeds,
+            "position_ids": position_ids,
+        }
+
+
 class AudioTransformersBackend(BaseBackend):
     """Audio HuggingFace Transformers backend"""
 
@@ -1392,6 +1817,7 @@ class TargetModelWrapper:
         ("hf", "VLM"): VLMTransformersBackend,
         ("hf", "TTS"): TTSTransformersBackend,
         ("hf", "Audio"): AudioTransformersBackend,
+        ("vllm", "LLM"): VLLMBackend,
         ("vllm", "VLM"): VLMVLLMBackend,
     }
 
