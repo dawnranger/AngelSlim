@@ -23,6 +23,333 @@ from angelslim.utils import decide_device_for_distributed, print_with_rank
 
 from .cosyvoice3_llm import CosyVoice3LM
 
+# ============================================================================
+# Picklable callable classes for vLLM apply_model (TP > 1 compatibility)
+#
+# When tensor_parallel_size > 1, vLLM uses multiproc_executor which
+# serializes functions via pickle through shared memory broadcast.
+# Local closures / nested functions cannot be pickled by standard pickle.
+# These module-level classes replace the original closures so that they
+# can be serialized and sent to vLLM worker processes.
+# ============================================================================
+
+
+class _VLMSetupHooksFn:
+    """Picklable callable that registers forward hooks inside a vLLM VLM worker."""
+
+    def __init__(self, cache_attr: str, tp_size: int, lm_module_name: str):
+        self.cache_attr = cache_attr
+        self.tp_size = tp_size
+        self.lm_module_name = lm_module_name
+
+    def __call__(self, model):
+        import torch
+
+        cache_attr = self.cache_attr
+        lm_module_name = self.lm_module_name
+        handles = []
+        setattr(
+            model,
+            cache_attr,
+            {
+                "all_hidden_states": [],
+                "inputs_embeds": None,
+                "position_ids": None,
+            },
+        )
+        cache = getattr(model, cache_attr)
+
+        tp_rank = 0
+        tp_world_size = self.tp_size
+        if tp_world_size > 1:
+            from vllm.distributed.parallel_state import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+
+            tp_rank = get_tensor_model_parallel_rank()
+            tp_world_size = get_tensor_model_parallel_world_size()
+
+        lm = getattr(model, lm_module_name, None)
+        if lm is None:
+            raise AttributeError(
+                f"Model does not have attribute '{lm_module_name}'. "
+                f"Available attributes: {list(model.__dict__.keys())}"
+            )
+
+        def pre_hook(module, args, hook_kwargs):
+            if "inputs_embeds" in hook_kwargs and hook_kwargs["inputs_embeds"] is not None:
+                embeds = hook_kwargs["inputs_embeds"].clone().detach()
+                if tp_rank == 0:
+                    cache["inputs_embeds"] = embeds.cpu()
+            pos_key = None
+            if "position_ids" in hook_kwargs and hook_kwargs["position_ids"] is not None:
+                pos_key = "position_ids"
+            elif "positions" in hook_kwargs and hook_kwargs["positions"] is not None:
+                pos_key = "positions"
+
+            pos_tensor = None
+            if pos_key is not None:
+                pos_tensor = hook_kwargs[pos_key]
+            elif len(args) >= 2 and args[1] is not None:
+                if isinstance(args[1], torch.Tensor):
+                    pos_tensor = args[1]
+
+            if pos_tensor is not None and tp_rank == 0:
+                new_len = pos_tensor.shape[-1]
+                old_pos = cache["position_ids"]
+                old_len = old_pos.shape[-1] if old_pos is not None else 0
+                if new_len > old_len:
+                    cache["position_ids"] = pos_tensor.clone().detach().cpu()
+            return args, hook_kwargs
+
+        pre_hook_target = getattr(lm, "model", lm)
+        h = pre_hook_target.register_forward_pre_hook(pre_hook, with_kwargs=True)
+        handles.append(h)
+
+        layers = None
+        for attr in ["layers", "decoder_layers", "h", "blocks"]:
+            layers = getattr(lm, attr, None)
+            if layers is not None:
+                break
+        if layers is None and hasattr(lm, "model"):
+            for attr in ["layers", "decoder_layers", "h", "blocks"]:
+                layers = getattr(lm.model, attr, None)
+                if layers is not None:
+                    break
+
+        if layers is not None:
+            cache["all_hidden_states"] = [None] * len(layers)
+
+            for layer_idx, layer in enumerate(layers):
+
+                def make_layer_hook(idx):
+                    def layer_hook(module, args, output):
+                        if isinstance(output, tuple) and len(output) == 2:
+                            hidden_states_out, residual_out = output
+                            if residual_out is not None:
+                                hidden = (hidden_states_out + residual_out).clone().detach()
+                            else:
+                                hidden = hidden_states_out.clone().detach()
+                        else:
+                            hidden = (
+                                output.clone().detach()
+                                if not isinstance(output, tuple)
+                                else output[0].clone().detach()
+                            )
+                        if tp_rank == 0:
+                            cache["all_hidden_states"][idx] = hidden.cpu()
+
+                        if idx == 0 and tp_rank == 0 and len(args) >= 1:
+                            pos_candidate = args[0]
+                            if isinstance(pos_candidate, torch.Tensor):
+                                new_len = pos_candidate.shape[-1]
+                                old_pos = cache["position_ids"]
+                                old_len = old_pos.shape[-1] if old_pos is not None else 0
+                                if new_len > old_len:
+                                    cache["position_ids"] = pos_candidate.clone().detach().cpu()
+
+                        return output
+
+                    return layer_hook
+
+                h = layer.register_forward_hook(make_layer_hook(layer_idx))
+                handles.append(h)
+
+            first_layer = layers[0]
+
+            def _first_layer_pre_hook(module, args, hook_kwargs):
+                if len(args) >= 1 and args[0] is not None:
+                    if isinstance(args[0], torch.Tensor) and tp_rank == 0:
+                        new_len = args[0].shape[-1]
+                        old_pos = cache["position_ids"]
+                        old_len = old_pos.shape[-1] if old_pos is not None else 0
+                        if new_len > old_len:
+                            cache["position_ids"] = args[0].clone().detach().cpu()
+                return args, hook_kwargs
+
+            h = first_layer.register_forward_pre_hook(_first_layer_pre_hook, with_kwargs=True)
+            handles.append(h)
+
+        cache["_handles"] = handles
+        return True
+
+
+class _VLMCollectAndCleanupFn:
+    """Picklable callable that reads hook data and cleans up."""
+
+    def __init__(self, cache_attr: str):
+        self.cache_attr = cache_attr
+
+    def __call__(self, model):
+        cache = getattr(model, self.cache_attr, None)
+        if cache is None:
+            return None
+        for h in cache.get("_handles", []):
+            h.remove()
+        result = {
+            "all_hidden_states": cache["all_hidden_states"],
+            "inputs_embeds": cache["inputs_embeds"],
+            "position_ids": cache["position_ids"],
+        }
+        delattr(model, self.cache_attr)
+        return result
+
+
+class _LLMSetupHooksFn:
+    """Picklable callable that registers forward hooks inside a vLLM LLM worker."""
+
+    def __init__(self, cache_attr: str, tp_size: int):
+        self.cache_attr = cache_attr
+        self.tp_size = tp_size
+
+    def __call__(self, model):
+        import torch
+
+        cache_attr = self.cache_attr
+        handles = []
+        setattr(
+            model,
+            cache_attr,
+            {
+                "all_hidden_states": [],
+                "inputs_embeds": None,
+                "position_ids": None,
+            },
+        )
+        cache = getattr(model, cache_attr)
+
+        tp_rank = 0
+        tp_world_size = self.tp_size
+        if tp_world_size > 1:
+            from vllm.distributed.parallel_state import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+
+            tp_rank = get_tensor_model_parallel_rank()
+            tp_world_size = get_tensor_model_parallel_world_size()
+
+        inner_model = getattr(model, "model", None)
+        if inner_model is None:
+            raise AttributeError(
+                f"Model does not have attribute 'model'. "
+                f"Available attributes: {list(model.__dict__.keys())}"
+            )
+
+        def pre_hook(module, args, hook_kwargs):
+            if "inputs_embeds" in hook_kwargs and hook_kwargs["inputs_embeds"] is not None:
+                embeds = hook_kwargs["inputs_embeds"].clone().detach()
+                if tp_rank == 0:
+                    cache["inputs_embeds"] = embeds.cpu()
+
+            pos_key = None
+            if "position_ids" in hook_kwargs and hook_kwargs["position_ids"] is not None:
+                pos_key = "position_ids"
+            elif "positions" in hook_kwargs and hook_kwargs["positions"] is not None:
+                pos_key = "positions"
+
+            pos_tensor = None
+            if pos_key is not None:
+                pos_tensor = hook_kwargs[pos_key]
+            elif len(args) >= 2 and args[1] is not None:
+                if isinstance(args[1], torch.Tensor):
+                    pos_tensor = args[1]
+
+            if pos_tensor is not None and tp_rank == 0:
+                new_len = pos_tensor.shape[-1]
+                old_pos = cache["position_ids"]
+                old_len = old_pos.shape[-1] if old_pos is not None else 0
+                if new_len > old_len:
+                    cache["position_ids"] = pos_tensor.clone().detach().cpu()
+            return args, hook_kwargs
+
+        h = inner_model.register_forward_pre_hook(pre_hook, with_kwargs=True)
+        handles.append(h)
+
+        layers = None
+        for attr in ["layers", "decoder_layers", "h", "blocks"]:
+            layers = getattr(inner_model, attr, None)
+            if layers is not None:
+                break
+
+        if layers is not None:
+            cache["all_hidden_states"] = [None] * len(layers)
+
+            for layer_idx, layer in enumerate(layers):
+
+                def make_layer_hook(idx):
+                    def layer_hook(module, args, output):
+                        if isinstance(output, tuple) and len(output) == 2:
+                            hidden_states_out, residual_out = output
+                            if residual_out is not None:
+                                hidden = (hidden_states_out + residual_out).clone().detach()
+                            else:
+                                hidden = hidden_states_out.clone().detach()
+                        else:
+                            hidden = (
+                                output.clone().detach()
+                                if not isinstance(output, tuple)
+                                else output[0].clone().detach()
+                            )
+                        if tp_rank == 0:
+                            cache["all_hidden_states"][idx] = hidden.cpu()
+
+                        if idx == 0 and tp_rank == 0 and len(args) >= 1:
+                            pos_candidate = args[0]
+                            if isinstance(pos_candidate, torch.Tensor):
+                                new_len = pos_candidate.shape[-1]
+                                old_pos = cache["position_ids"]
+                                old_len = old_pos.shape[-1] if old_pos is not None else 0
+                                if new_len > old_len:
+                                    cache["position_ids"] = pos_candidate.clone().detach().cpu()
+
+                        return output
+
+                    return layer_hook
+
+                h = layer.register_forward_hook(make_layer_hook(layer_idx))
+                handles.append(h)
+
+            first_layer = layers[0]
+
+            def _first_layer_pre_hook(module, args, hook_kwargs):
+                if len(args) >= 1 and args[0] is not None:
+                    if isinstance(args[0], torch.Tensor) and tp_rank == 0:
+                        new_len = args[0].shape[-1]
+                        old_pos = cache["position_ids"]
+                        old_len = old_pos.shape[-1] if old_pos is not None else 0
+                        if new_len > old_len:
+                            cache["position_ids"] = args[0].clone().detach().cpu()
+                return args, hook_kwargs
+
+            h = first_layer.register_forward_pre_hook(_first_layer_pre_hook, with_kwargs=True)
+            handles.append(h)
+
+        cache["_handles"] = handles
+        return True
+
+
+class _LLMCollectAndCleanupFn:
+    """Picklable callable that reads hook data and cleans up (for LLM backend)."""
+
+    def __init__(self, cache_attr: str):
+        self.cache_attr = cache_attr
+
+    def __call__(self, model):
+        cache = getattr(model, self.cache_attr, None)
+        if cache is None:
+            return None
+        for h in cache.get("_handles", []):
+            h.remove()
+        result = {
+            "all_hidden_states": cache["all_hidden_states"],
+            "inputs_embeds": cache["inputs_embeds"],
+            "position_ids": cache["position_ids"],
+        }
+        delattr(model, self.cache_attr)
+        return result
+
 
 class BaseBackend(ABC):
     """
@@ -532,7 +859,7 @@ class VLMVLLMBackend(BaseBackend):
         # Extract vllm-related parameters from kwargs
         tp_size = self.kwargs.get("tensor_parallel_size", 1)
         self.tp_size = (
-            tp_size  # Save TP size for hook functions to decide whether all_gather is needed
+            tp_size  # Save TP size for hook functions to decide whether to collect from tp_rank 0
         )
         max_model_len = self.kwargs.get("max_model_len", 8192)
         gpu_memory_utilization = self.kwargs.get("gpu_memory_utilization", 0.9)
@@ -792,226 +1119,13 @@ class VLMVLLMBackend(BaseBackend):
         aux_layer_ids = kwargs.get("aux_hidden_states_layer_ids", None)
         # Temporary attribute name used to store hook data inside the worker
         _CACHE_ATTR = "_vlm_vllm_hook_cache"
-        # TP size from model init, captured by setup_hooks_fn closure
+        # TP size from model init
         _tp_size = getattr(self, "tp_size", 1)
 
-        def setup_hooks_fn(model):
-            """Register hooks inside the vLLM worker and store data as a model attribute.
-
-            When TP > 1, each worker only holds a hidden_size / TP slice.
-            We use vLLM's TP-aware all_gather inside the worker to merge slices
-            before storing, avoiding conflicts with external torch.distributed.
-            Only the TP rank-0 worker stores the complete data; others store None.
-            """
-            handles = []
-            # Initialise cache
-            setattr(
-                model,
-                _CACHE_ATTR,
-                {
-                    "all_hidden_states": [],
-                    "inputs_embeds": None,
-                    "position_ids": None,
-                },
-            )
-            cache = getattr(model, _CACHE_ATTR)
-
-            # Determine TP rank and world_size.
-            # Use vLLM's own parallel_state to avoid conflicts with external
-            # torch.distributed (which may belong to the training launcher).
-            # When TP=1 we skip all distributed calls entirely.
-            tp_rank = 0
-            tp_world_size = _tp_size  # captured from outer scope (set before apply_model)
-            if tp_world_size > 1:
-                from vllm.distributed.parallel_state import (
-                    get_tensor_model_parallel_rank,
-                    get_tensor_model_parallel_world_size,
-                )
-
-                tp_rank = get_tensor_model_parallel_rank()
-                tp_world_size = get_tensor_model_parallel_world_size()
-
-            def _all_gather_hidden(hidden: torch.Tensor) -> torch.Tensor:
-                """All-gather hidden states within the TP group, concatenating on the last dim.
-
-                TP splits hidden_size evenly across ranks; after all_gather we
-                concatenate along dim=-1 to restore the full hidden states.
-                """
-                if tp_world_size <= 1:
-                    return hidden
-                import torch.distributed as worker_dist
-                from vllm.distributed.parallel_state import (
-                    get_tensor_model_parallel_group,
-                )
-
-                # hidden: [batch, seq_len, hidden_size_per_tp]
-                gathered = [torch.empty_like(hidden) for _ in range(tp_world_size)]
-                worker_dist.all_gather(gathered, hidden, group=get_tensor_model_parallel_group())
-                # Concatenate along the last dimension to restore full hidden_size
-                return torch.cat(gathered, dim=-1)
-
-            # Retrieve the language model sub-module
-            lm = getattr(model, lm_module_name, None)
-            if lm is None:
-                raise AttributeError(
-                    f"Model does not have attribute '{lm_module_name}'. "
-                    f"Available attributes: {list(model.__dict__.keys())}"
-                )
-
-            # Hook 1: capture inputs_embeds and position_ids
-            # NOTE: In vLLM, the VLM's forward() calls language_model.model(...)
-            # directly, bypassing language_model.forward(). So we must register
-            # the pre_hook on lm.model (the actual decoder model) rather than lm
-            # (the CausalLM wrapper). Also, vLLM uses "positions" as the kwarg
-            # name instead of "position_ids".
-            def pre_hook(module, args, hook_kwargs):
-                if "inputs_embeds" in hook_kwargs and hook_kwargs["inputs_embeds"] is not None:
-                    embeds = hook_kwargs["inputs_embeds"].clone().detach()
-                    # When TP > 1, inputs_embeds is also split along hidden_size; all_gather needed
-                    embeds = _all_gather_hidden(embeds)
-                    if tp_rank == 0:
-                        cache["inputs_embeds"] = embeds.cpu()
-                # vLLM uses "positions" (not "position_ids") as the kwarg name
-                pos_key = None
-                if "position_ids" in hook_kwargs and hook_kwargs["position_ids"] is not None:
-                    pos_key = "position_ids"
-                elif "positions" in hook_kwargs and hook_kwargs["positions"] is not None:
-                    pos_key = "positions"
-
-                pos_tensor = None
-                if pos_key is not None:
-                    pos_tensor = hook_kwargs[pos_key]
-                elif len(args) >= 2 and args[1] is not None:
-                    if isinstance(args[1], torch.Tensor):
-                        pos_tensor = args[1]
-
-                if pos_tensor is not None and tp_rank == 0:
-                    # Only keep the longest positions (from prefill, not decode).
-                    # vLLM calls model.forward multiple times: prefill (full seq)
-                    # then decode (1 token at a time). We want the prefill positions.
-                    new_len = pos_tensor.shape[-1]
-                    old_pos = cache["position_ids"]
-                    old_len = old_pos.shape[-1] if old_pos is not None else 0
-                    if new_len > old_len:
-                        cache["position_ids"] = pos_tensor.clone().detach().cpu()
-                return args, hook_kwargs
-
-            # Register pre_hook on the inner model (lm.model) if it exists,
-            # because vLLM's VLM forward() calls lm.model(...) directly.
-            pre_hook_target = getattr(lm, "model", lm)
-            h = pre_hook_target.register_forward_pre_hook(pre_hook, with_kwargs=True)
-            handles.append(h)
-
-            # Hook 2: register a post-hook on each decoder layer to collect hidden states
-            layers = None
-            for attr in ["layers", "decoder_layers", "h", "blocks"]:
-                layers = getattr(lm, attr, None)
-                if layers is not None:
-                    break
-            # If lm itself has no layers attribute, try lm.model
-            if layers is None and hasattr(lm, "model"):
-                for attr in ["layers", "decoder_layers", "h", "blocks"]:
-                    layers = getattr(lm.model, attr, None)
-                    if layers is not None:
-                        break
-
-            if layers is not None:
-                cache["all_hidden_states"] = [None] * len(layers)
-
-                for layer_idx, layer in enumerate(layers):
-
-                    def make_layer_hook(idx):
-                        def layer_hook(module, args, output):
-                            # vLLM decoder layers return (hidden_states, residual)
-                            # where hidden_states is the MLP output BEFORE adding
-                            # the residual.  To match HuggingFace Transformers'
-                            # output_hidden_states (which returns the full layer
-                            # output = hidden_states + residual), we must add them
-                            # together here.
-                            if isinstance(output, tuple) and len(output) == 2:
-                                hidden_states_out, residual_out = output
-                                if residual_out is not None:
-                                    hidden = (hidden_states_out + residual_out).clone().detach()
-                                else:
-                                    hidden = hidden_states_out.clone().detach()
-                            else:
-                                hidden = (
-                                    output.clone().detach()
-                                    if not isinstance(output, tuple)
-                                    else output[0].clone().detach()
-                                )
-                            # TP > 1: all_gather to merge hidden_size slices from each rank
-                            hidden = _all_gather_hidden(hidden)
-                            # Only TP rank 0 stores the complete data
-                            if tp_rank == 0:
-                                cache["all_hidden_states"][idx] = hidden.cpu()
-
-                            # Capture positions from the first layer's input args.
-                            # In vLLM, DecoderLayer.forward(positions, hidden_states, residual)
-                            # receives positions as the first positional arg.
-                            # We capture from every layer (idx==0 is enough but we use
-                            # "keep longest" logic to handle chunked prefill).
-                            if idx == 0 and tp_rank == 0 and len(args) >= 1:
-                                pos_candidate = args[0]
-                                if isinstance(pos_candidate, torch.Tensor):
-                                    new_len = pos_candidate.shape[-1]
-                                    old_pos = cache["position_ids"]
-                                    old_len = old_pos.shape[-1] if old_pos is not None else 0
-                                    if new_len > old_len:
-                                        cache["position_ids"] = (
-                                            pos_candidate.clone().detach().cpu()
-                                        )
-
-                            return output
-
-                        return layer_hook
-
-                    h = layer.register_forward_hook(make_layer_hook(layer_idx))
-                    handles.append(h)
-
-                # Hook 3: register a pre-hook on the FIRST decoder layer to
-                # capture positions.  In vLLM, Qwen3LLMModel.forward() calls
-                # each layer as `layer(positions, hidden_states, residual)`,
-                # passing positions as the first positional arg.  The model-level
-                # pre_hook may fail to capture positions when they are passed as
-                # positional args (not kwargs) in certain vLLM code paths.
-                first_layer = layers[0]
-
-                def _first_layer_pre_hook(module, args, hook_kwargs):
-                    # positions is the first positional arg of DecoderLayer.forward
-                    if len(args) >= 1 and args[0] is not None:
-                        if isinstance(args[0], torch.Tensor) and tp_rank == 0:
-                            new_len = args[0].shape[-1]
-                            old_pos = cache["position_ids"]
-                            old_len = old_pos.shape[-1] if old_pos is not None else 0
-                            if new_len > old_len:
-                                cache["position_ids"] = args[0].clone().detach().cpu()
-                    return args, hook_kwargs
-
-                h = first_layer.register_forward_pre_hook(_first_layer_pre_hook, with_kwargs=True)
-                handles.append(h)
-
-            # Store handles in cache for later cleanup
-            cache["_handles"] = handles
-            return True
-
-        def collect_and_cleanup_fn(model):
-            """Read hook data from the model's temporary attribute and clean up."""
-            cache = getattr(model, _CACHE_ATTR, None)
-            if cache is None:
-                return None
-            # Remove all hooks
-            for h in cache.get("_handles", []):
-                h.remove()
-            # Read collected data
-            result = {
-                "all_hidden_states": cache["all_hidden_states"],
-                "inputs_embeds": cache["inputs_embeds"],
-                "position_ids": cache["position_ids"],
-            }
-            # Clean up temporary attribute
-            delattr(model, _CACHE_ATTR)
-            return result
+        # Use picklable callable classes instead of local closures so that
+        # vLLM's multiproc_executor can serialize them via pickle when TP > 1.
+        setup_hooks_fn = _VLMSetupHooksFn(_CACHE_ATTR, _tp_size, lm_module_name)
+        collect_and_cleanup_fn = _VLMCollectAndCleanupFn(_CACHE_ATTR)
 
         # Register hooks inside the worker; include in try-finally so that
         # partially-registered hooks are always cleaned up on failure.
@@ -1283,181 +1397,13 @@ class VLLMBackend(BaseBackend):
         aux_layer_ids = kwargs.get("aux_hidden_states_layer_ids", None)
         # Temporary attribute name used to store hook data inside the worker
         _CACHE_ATTR = "_llm_vllm_hook_cache"
-        # TP size from model init, captured by setup_hooks_fn closure
+        # TP size from model init
         _tp_size = getattr(self, "tp_size", 1)
 
-        def setup_hooks_fn(model):
-            """Register hooks inside the vLLM worker and store data as a model attribute.
-
-            For pure text LLMs (e.g. Qwen2ForCausalLM, Qwen3ForCausalLM),
-            the top-level model IS the CausalLM itself, with `model.model`
-            being the decoder model containing `layers`.
-
-            When TP > 1, each worker only holds a hidden_size / TP slice.
-            We use vLLM's TP-aware all_gather inside the worker to merge slices
-            before storing, avoiding conflicts with external torch.distributed.
-            Only the TP rank-0 worker stores the complete data; others store None.
-            """
-            handles = []
-            setattr(
-                model,
-                _CACHE_ATTR,
-                {
-                    "all_hidden_states": [],
-                    "inputs_embeds": None,
-                    "position_ids": None,
-                },
-            )
-            cache = getattr(model, _CACHE_ATTR)
-
-            tp_rank = 0
-            tp_world_size = _tp_size
-            if tp_world_size > 1:
-                from vllm.distributed.parallel_state import (
-                    get_tensor_model_parallel_rank,
-                    get_tensor_model_parallel_world_size,
-                )
-
-                tp_rank = get_tensor_model_parallel_rank()
-                tp_world_size = get_tensor_model_parallel_world_size()
-
-            def _all_gather_hidden(hidden: torch.Tensor) -> torch.Tensor:
-                """All-gather hidden states within the TP group."""
-                if tp_world_size <= 1:
-                    return hidden
-                import torch.distributed as worker_dist
-                from vllm.distributed.parallel_state import (
-                    get_tensor_model_parallel_group,
-                )
-
-                gathered = [torch.empty_like(hidden) for _ in range(tp_world_size)]
-                worker_dist.all_gather(gathered, hidden, group=get_tensor_model_parallel_group())
-                return torch.cat(gathered, dim=-1)
-
-            # For pure text LLMs, the model itself is the CausalLM.
-            # model.model is the decoder model (e.g. Qwen2Model, Qwen3Model).
-            inner_model = getattr(model, "model", None)
-            if inner_model is None:
-                raise AttributeError(
-                    f"Model does not have attribute 'model'. "
-                    f"Available attributes: {list(model.__dict__.keys())}"
-                )
-
-            # Hook 1: capture inputs_embeds and position_ids from the inner model
-            def pre_hook(module, args, hook_kwargs):
-                if "inputs_embeds" in hook_kwargs and hook_kwargs["inputs_embeds"] is not None:
-                    embeds = hook_kwargs["inputs_embeds"].clone().detach()
-                    embeds = _all_gather_hidden(embeds)
-                    if tp_rank == 0:
-                        cache["inputs_embeds"] = embeds.cpu()
-
-                pos_key = None
-                if "position_ids" in hook_kwargs and hook_kwargs["position_ids"] is not None:
-                    pos_key = "position_ids"
-                elif "positions" in hook_kwargs and hook_kwargs["positions"] is not None:
-                    pos_key = "positions"
-
-                pos_tensor = None
-                if pos_key is not None:
-                    pos_tensor = hook_kwargs[pos_key]
-                elif len(args) >= 2 and args[1] is not None:
-                    if isinstance(args[1], torch.Tensor):
-                        pos_tensor = args[1]
-
-                if pos_tensor is not None and tp_rank == 0:
-                    new_len = pos_tensor.shape[-1]
-                    old_pos = cache["position_ids"]
-                    old_len = old_pos.shape[-1] if old_pos is not None else 0
-                    if new_len > old_len:
-                        cache["position_ids"] = pos_tensor.clone().detach().cpu()
-                return args, hook_kwargs
-
-            h = inner_model.register_forward_pre_hook(pre_hook, with_kwargs=True)
-            handles.append(h)
-
-            # Hook 2: register a post-hook on each decoder layer to collect hidden states
-            layers = None
-            for attr in ["layers", "decoder_layers", "h", "blocks"]:
-                layers = getattr(inner_model, attr, None)
-                if layers is not None:
-                    break
-
-            if layers is not None:
-                cache["all_hidden_states"] = [None] * len(layers)
-
-                for layer_idx, layer in enumerate(layers):
-
-                    def make_layer_hook(idx):
-                        def layer_hook(module, args, output):
-                            # vLLM decoder layers return (hidden_states, residual)
-                            if isinstance(output, tuple) and len(output) == 2:
-                                hidden_states_out, residual_out = output
-                                if residual_out is not None:
-                                    hidden = (hidden_states_out + residual_out).clone().detach()
-                                else:
-                                    hidden = hidden_states_out.clone().detach()
-                            else:
-                                hidden = (
-                                    output.clone().detach()
-                                    if not isinstance(output, tuple)
-                                    else output[0].clone().detach()
-                                )
-                            hidden = _all_gather_hidden(hidden)
-                            if tp_rank == 0:
-                                cache["all_hidden_states"][idx] = hidden.cpu()
-
-                            # Capture positions from the first layer's input args
-                            if idx == 0 and tp_rank == 0 and len(args) >= 1:
-                                pos_candidate = args[0]
-                                if isinstance(pos_candidate, torch.Tensor):
-                                    new_len = pos_candidate.shape[-1]
-                                    old_pos = cache["position_ids"]
-                                    old_len = old_pos.shape[-1] if old_pos is not None else 0
-                                    if new_len > old_len:
-                                        cache["position_ids"] = (
-                                            pos_candidate.clone().detach().cpu()
-                                        )
-
-                            return output
-
-                        return layer_hook
-
-                    h = layer.register_forward_hook(make_layer_hook(layer_idx))
-                    handles.append(h)
-
-                # Hook 3: pre-hook on the first decoder layer to capture positions
-                first_layer = layers[0]
-
-                def _first_layer_pre_hook(module, args, hook_kwargs):
-                    if len(args) >= 1 and args[0] is not None:
-                        if isinstance(args[0], torch.Tensor) and tp_rank == 0:
-                            new_len = args[0].shape[-1]
-                            old_pos = cache["position_ids"]
-                            old_len = old_pos.shape[-1] if old_pos is not None else 0
-                            if new_len > old_len:
-                                cache["position_ids"] = args[0].clone().detach().cpu()
-                    return args, hook_kwargs
-
-                h = first_layer.register_forward_pre_hook(_first_layer_pre_hook, with_kwargs=True)
-                handles.append(h)
-
-            cache["_handles"] = handles
-            return True
-
-        def collect_and_cleanup_fn(model):
-            """Read hook data from the model's temporary attribute and clean up."""
-            cache = getattr(model, _CACHE_ATTR, None)
-            if cache is None:
-                return None
-            for h in cache.get("_handles", []):
-                h.remove()
-            result = {
-                "all_hidden_states": cache["all_hidden_states"],
-                "inputs_embeds": cache["inputs_embeds"],
-                "position_ids": cache["position_ids"],
-            }
-            delattr(model, _CACHE_ATTR)
-            return result
+        # Use picklable callable classes instead of local closures so that
+        # vLLM's multiproc_executor can serialize them via pickle when TP > 1.
+        setup_hooks_fn = _LLMSetupHooksFn(_CACHE_ATTR, _tp_size)
+        collect_and_cleanup_fn = _LLMCollectAndCleanupFn(_CACHE_ATTR)
 
         # Register hooks inside the worker
         try:
