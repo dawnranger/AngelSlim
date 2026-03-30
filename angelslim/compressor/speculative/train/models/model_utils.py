@@ -114,6 +114,26 @@ def apply_rotary_pos_emb_mrope(q, k, cos, sin, position_ids=None, unsqueeze_dim=
 # model_type -> (lm_head_key, embed_weight_key, chat_template_type)
 # key: model_type (from AutoConfig)
 MODEL_TYPE_PARAM_MAP: dict = {
+    "qwen2.5": (
+        "lm_head.weight",
+        "model.embed_tokens.weight",
+        "qwen2.5",
+    ),
+    "qwen2.5_vl": (
+        "lm_head.weight",
+        "model.embed_tokens.weight",
+        "qwen2.5_vl",
+    ),
+    "qwen2_audio": (
+        "lm_head.weight",
+        "language_model.model.embed_tokens.weight",
+        "qwen2_audio",
+    ),
+    "qwen3": (
+        "lm_head.weight",
+        "model.embed_tokens.weight",
+        "qwen3",
+    ),
     "qwen3_vl": (
         "lm_head.weight",
         "model.language_model.embed_tokens.weight",
@@ -128,21 +148,6 @@ MODEL_TYPE_PARAM_MAP: dict = {
         "model.embed_tokens.weight",
         "model.embed_tokens.weight",
         "hunyuan_vl",
-    ),
-    "qwen2_audio": (
-        "lm_head.weight",
-        "language_model.model.embed_tokens.weight",
-        "qwen2_audio",
-    ),
-    "qwen3": (
-        "lm_head.weight",
-        "model.embed_tokens.weight",
-        "qwen3",
-    ),
-    "qwen2_5": (
-        "lm_head.weight",
-        "model.embed_tokens.weight",
-        "qwen2.5",
     ),
     "llama": (
         "lm_head.weight",
