@@ -610,7 +610,7 @@ class TransformersBackend(BaseBackend):
 class VLMTransformersBackend(BaseBackend):
     """VLM HuggingFace Transformers backend"""
 
-    SUPPORT_MODEL_TYPE = ["hunyuan_vl", "qwen3_vl", "qwen2.5_vl"]
+    SUPPORT_MODEL_TYPE = ["hunyuan_vl", "qwen3_vl", "qwen2_5_vl"]
 
     def load_model(self):
         if self.target_model_type is None or self.target_model_type not in self.SUPPORT_MODEL_TYPE:
@@ -632,7 +632,7 @@ class VLMTransformersBackend(BaseBackend):
 
             # Load processor
             self.tokenizer = AutoProcessor.from_pretrained(self.model_path, trust_remote_code=True)
-        elif self.target_model_type in ("qwen3_vl", "qwen2.5_vl"):
+        elif self.target_model_type in ("qwen3_vl", "qwen2_5_vl"):
             from transformers import AutoModelForImageTextToText, AutoProcessor
 
             device = decide_device_for_distributed()
@@ -702,7 +702,7 @@ class VLMTransformersBackend(BaseBackend):
                 position_ids_list.append(kwargs["position_ids"].clone().detach())
             return args, kwargs
 
-        if self.target_model_type in ("qwen3_vl", "qwen2.5_vl"):
+        if self.target_model_type in ("qwen3_vl", "qwen2_5_vl"):
             handle = self.model.language_model.register_forward_pre_hook(hook, with_kwargs=True)
         elif self.target_model_type == "hunyuan_vl":
             handle = self.model.model.register_forward_pre_hook(hook, with_kwargs=True)
@@ -772,7 +772,7 @@ class VLMTransformersBackend(BaseBackend):
                 position_ids_list.append(kwargs["position_ids"].clone().detach())
             return args, kwargs
 
-        if self.target_model_type in ("qwen3_vl", "qwen2.5_vl"):
+        if self.target_model_type in ("qwen3_vl", "qwen2_5_vl"):
             handle = self.model.language_model.register_forward_pre_hook(hook, with_kwargs=True)
         elif self.target_model_type == "hunyuan_vl":
             handle = self.model.model.register_forward_pre_hook(hook, with_kwargs=True)
@@ -832,11 +832,11 @@ class VLMVLLMBackend(BaseBackend):
 
     Supported model types:
         - qwen3_vl: Qwen3-VL series vision-language models
-        - qwen2.5_vl: Qwen2.5-VL series vision-language models
+        - qwen2_5_vl: Qwen2.5-VL series vision-language models
         - hunyuan_vl: HunYuan-VL series vision-language models
     """
 
-    SUPPORT_MODEL_TYPE = ["qwen3_vl", "qwen2.5_vl", "hunyuan_vl"]
+    SUPPORT_MODEL_TYPE = ["qwen3_vl", "qwen2_5_vl", "hunyuan_vl"]
 
     def load_model(self) -> None:
         """Load VLM model using vLLM.
@@ -926,7 +926,7 @@ class VLMVLLMBackend(BaseBackend):
 
     def _get_language_model_module_name(self) -> str:
         """Return the language model sub-module name based on model type."""
-        if self.target_model_type in ("qwen3_vl", "qwen2.5_vl"):
+        if self.target_model_type in ("qwen3_vl", "qwen2_5_vl"):
             return "language_model"
         elif self.target_model_type == "hunyuan_vl":
             return "model"

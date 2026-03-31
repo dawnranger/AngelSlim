@@ -119,10 +119,10 @@ MODEL_TYPE_PARAM_MAP: dict = {
         "model.embed_tokens.weight",
         "qwen2.5",
     ),
-    "qwen2.5_vl": (
+    "qwen2_5_vl": (
         "lm_head.weight",
         "model.embed_tokens.weight",
-        "qwen2.5_vl",
+        "qwen2_5_vl",
     ),
     "qwen2_audio": (
         "lm_head.weight",

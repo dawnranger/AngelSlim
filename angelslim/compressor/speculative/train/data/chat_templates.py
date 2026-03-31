@@ -28,7 +28,7 @@ class ChatTemplateType(Enum):
 
     QWEN2_AUDIO = "qwen2_audio"
     QWEN2_5 = "qwen2.5"
-    QWEN2_5_VL = "qwen2.5_vl"
+    QWEN2_5_VL = "qwen2_5_vl"
     QWEN3 = "qwen3"
     HUNYUAN = "hunyuan"
     QWEN3_VL = "qwen3_vl"
@@ -40,7 +40,7 @@ class ChatTemplateType(Enum):
 CHAT_TEMPLATE_TYPE_MAPPING = {
     "qwen2_audio": ChatTemplateType.QWEN2_AUDIO,
     "qwen2.5": ChatTemplateType.QWEN2_5,
-    "qwen2.5_vl": ChatTemplateType.QWEN2_5_VL,
+    "qwen2_5_vl": ChatTemplateType.QWEN2_5_VL,
     "qwen3": ChatTemplateType.QWEN3,
     "hunyuan": ChatTemplateType.HUNYUAN,
     "hunyuan_7b": ChatTemplateType.HUNYUAN_7B,

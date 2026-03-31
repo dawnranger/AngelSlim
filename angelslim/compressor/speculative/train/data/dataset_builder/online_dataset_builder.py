@@ -71,7 +71,7 @@ class OnlineLLMDatasetBuilder(OnlineDatasetBuilder):
         return DataCollatorWithPadding()
 
 
-@DatasetBuilderFactory.register("online", "VLM", "qwen2.5_vl")
+@DatasetBuilderFactory.register("online", "VLM", "qwen2_5_vl")
 @DatasetBuilderFactory.register("online", "VLM", "qwen3_vl")
 class OnlineVLMDatasetBuilder(OnlineDatasetBuilder):
     def __init__(
