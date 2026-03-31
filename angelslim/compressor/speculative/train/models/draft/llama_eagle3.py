@@ -145,7 +145,13 @@ class MRotaryEmbedding(nn.Module):
     def __init__(self, config, device=None):
         super().__init__()
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            self.rope_type = config.rope_scaling.get("rope_type", "default")
+            self.rope_type = config.rope_scaling.get(
+                "rope_type", config.rope_scaling.get("type", "default")
+            )
+            # mrope is actually a special case of default RoPE that uses the same inv_freq
+            # calculation but with different layout in forward.
+            if self.rope_type == "mrope":
+                self.rope_type = "default"
         else:
             self.rope_type = "default"
         self.max_seq_len_cached = config.max_position_embeddings
@@ -255,8 +261,10 @@ class LlamaAttention(nn.Module):
                 self.head_dim, max_position_embeddings=self.max_position_embeddings
             )
         else:
-            scaling_type = self.config.rope_scaling["type"]
-            if self.config.rope_scaling.get("mrope_interleaved", False):
+            scaling_type = self.config.rope_scaling.get(
+                "type", self.config.rope_scaling.get("rope_type", "default")
+            )
+            if scaling_type == "mrope" or self.config.rope_scaling.get("mrope_interleaved", False):
                 self.rotary_emb = MRotaryEmbedding(self.config)
                 self.rope_apply_func = apply_rotary_pos_emb_mrope
             elif scaling_type == "linear":
