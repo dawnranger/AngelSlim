@@ -397,24 +397,24 @@ class LlamaAttention(nn.Module):
             # [bsz, heads, q_len, kv_len] attention score matrix at once (OOM on
             # long sequences). Split q_len into chunks, each constructing only a
             # [bsz, heads, chunk_size, kv_len] score matrix.
-            _LSE_CHUNK_SIZE = 1024
-            k0_t_float = k0.float().transpose(2, 3)  # [bsz, heads, head_dim, kv_len]
+            # Use bf16 matmul for speed (leverages Tensor Cores), only convert to
+            # float32 for the numerically sensitive logsumexp reduction.
+            _LSE_CHUNK_SIZE = 2048
+            k0_t = k0.transpose(2, 3)  # [bsz, heads, head_dim, kv_len], keep bf16
             lse_A_chunks = []
             for _c_start in range(0, q_len, _LSE_CHUNK_SIZE):
                 _c_end = min(_c_start + _LSE_CHUNK_SIZE, q_len)
-                # [bsz, heads, chunk_size, kv_len]
-                _q_chunk = query_states[:, :, _c_start:_c_end, :].float()
-                _scores_chunk = torch.matmul(_q_chunk, k0_t_float) * scale
+                # [bsz, heads, chunk_size, kv_len] - bf16 matmul
+                _q_chunk = query_states[:, :, _c_start:_c_end, :]
+                _scores_chunk = torch.matmul(_q_chunk, k0_t) * scale
                 if attention_mask is not None:
-                    _scores_chunk = (
-                        _scores_chunk + attention_mask[:, :, _c_start:_c_end, :].float()
-                    )
-                # [bsz, heads, chunk_size]
-                lse_A_chunks.append(torch.logsumexp(_scores_chunk, dim=-1))
+                    _scores_chunk = _scores_chunk + attention_mask[:, :, _c_start:_c_end, :]
+                # [bsz, heads, chunk_size] - only logsumexp in float32
+                lse_A_chunks.append(torch.logsumexp(_scores_chunk.float(), dim=-1))
                 del _scores_chunk, _q_chunk
             # lse_A: [bsz, heads, q_len]
             lse_A = torch.cat(lse_A_chunks, dim=-1)
-            del lse_A_chunks, k0_t_float
+            del lse_A_chunks, k0_t
 
         # Part B: compute scalar attention score for each cache token
         # cache_k[i] shape: [bsz, heads, 1, head_dim] (single token)
