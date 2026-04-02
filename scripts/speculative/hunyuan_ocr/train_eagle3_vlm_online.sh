@@ -7,7 +7,7 @@ TRAIN_DATA_PATH=
 EVAL_DATA_PATH=
 OUTPUT_DIR=
 EMBED_WEIGHT_KEY="model.embed_tokens.weight"
-MODEL_MAX_LENGTH=8192
+MAX_MODEL_LEN=8192
 CHAT_TEMPLATE_TYPE=hunyuan_vl
 export MAX_PIXELS=
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
@@ -31,7 +31,7 @@ torchrun --nproc_per_node=8 tools/train_eagle3_online.py \
     --warmup_ratio 0.1 \
     --lr_scheduler_type "constant" \
     --logging_steps 20 \
-    --model_max_length $MODEL_MAX_LENGTH \
+    --max_model_len $MAX_MODEL_LEN \
     --embed_weight_key $EMBED_WEIGHT_KEY \
     --deepspeed $CONFIG_DIR/deepspeed_zero3.json \
     --chat_template_type $CHAT_TEMPLATE_TYPE \

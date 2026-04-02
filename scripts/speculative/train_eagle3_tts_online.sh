@@ -6,7 +6,7 @@ export DRAFT_MODEL_CONFIG_PATH=$CONFIG_DIR/cosyvoice3-llm-eagle3.json
 export TRAIN_DATA_PATH=
 export OUTPUT_DIR=
 export RUN_NAME=
-export MODEL_MAX_LENGTH=
+export MAX_MODEL_LEN=
 
 torchrun --nproc_per_node=8 tools/train_eagle3_online.py \
     --modal_type TTS \
@@ -25,7 +25,7 @@ torchrun --nproc_per_node=8 tools/train_eagle3_online.py \
     --warmup_ratio 0.1 \
     --lr_scheduler_type "constant" \
     --logging_steps 20 \
-    --model_max_length $MODEL_MAX_LENGTH \
+    --max_model_len $MAX_MODEL_LEN \
     --training_time_test_length 4 \
     --deepspeed $CONFIG_DIR/deepspeed_zero3.json \
     --report_to wandb \

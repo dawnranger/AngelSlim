@@ -94,7 +94,7 @@ bash scripts/speculative/qwen2_audio/train_eagle3_audio_online.sh
 - `TRAIN_DATA_PATH`: 训练数据路径
 - `EVAL_DATA_PATH`: 验证数据路径
 - `OUTPUT_DIR`: Eagle3模型输出路径
-- `MODEL_MAX_LENGTH`: 训练数据的最大长度
+- `MAX_MODEL_LEN`: 训练数据的最大长度
 - `CHAT_TEMPLATE_TYPE`: 目标模型的数据模板类型
 
 ## 4. 基准测试

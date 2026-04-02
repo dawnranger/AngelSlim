@@ -53,7 +53,7 @@ bash scripts/speculative/train_eagle3_tts_online.sh
 - `DRAFT_MODEL_CONFIG_PATH`: 草稿模型的config路径
 - `TRAIN_DATA_PATH`: 训练数据路径
 - `OUTPUT_DIR`: Eagle3模型输出路径
-- `MODEL_MAX_LENGTH`: 训练数据的最大长度
+- `MAX_MODEL_LEN`: 训练数据的最大长度
 
 
 ## 4. 基准测试

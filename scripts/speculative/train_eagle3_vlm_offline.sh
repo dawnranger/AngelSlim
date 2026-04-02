@@ -8,7 +8,7 @@ export TRAIN_HIDDEN_PATH=
 export EVAL_HIDDEN_PATH=
 export OUTPUT_DIR=
 export RUN_NAME=
-export MODEL_MAX_LENGTH=4096
+export MAX_MODEL_LEN=4096
 export LM_HEAD_KEY=
 export CHAT_TEMPLATE_TYPE=qwen3_vl
 
@@ -31,7 +31,7 @@ torchrun --nproc_per_node=8 tools/train_eagle3_offline.py \
     --warmup_ratio 0.1 \
     --lr_scheduler_type "constant" \
     --logging_steps 100 \
-    --model_max_length $MODEL_MAX_LENGTH \
+    --max_model_len $MAX_MODEL_LEN \
     --chat_template_type $CHAT_TEMPLATE_TYPE \
     --lm_head_key $LM_HEAD_KEY \
     --deepspeed $CONFIG_DIR/deepspeed_zero3.json \

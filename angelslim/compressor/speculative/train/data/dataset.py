@@ -36,7 +36,7 @@ class DatasetManager:
         self,
         data_args,
         tokenizer: Optional[AutoTokenizer] = None,
-        model_max_length: int = 2048,
+        max_model_len: int = 2048,
         chat_template_type: Optional[Union[str, ChatTemplateType]] = None,
         display: bool = False,
         cache_in_memory: bool = False,
@@ -48,7 +48,7 @@ class DatasetManager:
         Args:
             data_args: DataArguments object containing data paths and configurations
             tokenizer: Tokenizer for the model (required for online dataset processing)
-            model_max_length: Maximum sequence length
+            max_model_len: Maximum sequence length
             chat_template_type: Chat template type for conversation formatting. Can be:
                 - ChatTemplateType enum value (e.g., ChatTemplateType.QWEN3)
                 - String (e.g., "llama", "qwen")
@@ -58,7 +58,7 @@ class DatasetManager:
         """
         self.data_args = data_args
         self.tokenizer = tokenizer
-        self.model_max_length = model_max_length
+        self.max_model_len = max_model_len
         self.display = display
         self.cache_in_memory = cache_in_memory
         self.target_model_type = target_model_type
@@ -80,7 +80,7 @@ class DatasetManager:
                 modal_type=data_args.modal_type,
                 target_model_type=self.target_model_type,
                 tokenizer=tokenizer,
-                max_length=model_max_length,
+                max_length=max_model_len,
                 shuffle_seed=data_args.shuffle_seed,
                 chat_template_type=chat_template_type,
                 display=display,

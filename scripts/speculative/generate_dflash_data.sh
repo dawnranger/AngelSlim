@@ -32,7 +32,7 @@ torchrun \
     --draft_model_config_path $ROOT_DIR/configs/qwen3_dflash.json \
     --train_data_path $TRAIN_DATA_PATH \
     --output_dir $OUTPUT_DIR \
-    --model_max_length 3072 \
+    --max_model_len 3072 \
     --chat_template_type qwen3 \
     --batch_size 1 \
     --num_proc 16 \

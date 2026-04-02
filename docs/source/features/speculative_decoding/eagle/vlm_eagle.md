@@ -141,7 +141,7 @@ bash scripts/speculative/qwen3_vl/train_eagle3_vlm_online.sh
 - `TRAIN_DATA_PATH`: 训练数据路径
 - `EVAL_DATA_PATH`: 验证数据路径
 - `OUTPUT_DIR`: Eagle3模型输出路径
-- `MODEL_MAX_LENGTH`: 训练数据的最大长度
+- `MAX_MODEL_LEN`: 训练数据的最大长度
 - `CHAT_TEMPLATE_TYPE`: 目标模型的数据模板类型
 
 ### 3.2 离线训练
@@ -165,7 +165,7 @@ bash scripts/speculative/qwen3_vl/train_eagle3_vlm_offline.sh
 - `TRAIN_HIDDEN_PATH`: 训练hidden states数据路径
 - `EVAL_HIDDEN_PATH`: 验证hidden states数据路径
 - `OUTPUT_DIR`: Eagle3模型输出路径
-- `MODEL_MAX_LENGTH`: 训练数据的最大长度
+- `MAX_MODEL_LEN`: 训练数据的最大长度
 - `CHAT_TEMPLATE_TYPE`: 目标模型的数据模板类型
 - `LM_HEAD_KEY`: 目标模型lm head的weight key名称，可以在model.safetensors.index.json中查看，默认为lm_head.weight时可不指定这个参数。当为model.embed_tokens.weight时，需要指定。
 - `RUN_NAME`: 当`report_to`设为wand时，可以指定该参数设置wand中的run name。

@@ -38,7 +38,7 @@ torchrun \
     --learning_rate 6e-4 \
     --warmup_ratio 0.04 \
     --max_grad_norm 1.0 \
-    --model_max_length 3072 \
+    --max_model_len 3072 \
     --chat_template_type qwen3 \
     --attention_backend $ATTENTION_BACKEND \
     --block_size 16 \

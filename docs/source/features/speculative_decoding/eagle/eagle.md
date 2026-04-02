@@ -83,7 +83,7 @@ bash scripts/speculative/generate_vlm_hidden_for_draft_model.sh
 - `DATASET_PATH`: 输入数据集的HF名称或本地路径
 - `MODEL_NAME`: 目标模型的HF名称或本地路径
 - `TARGET_BACKEND`: 目标模型后端，目前仅支持HF
-- `MODEL_MAX_LENGTH`: 生成数据的上下文长度
+- `MAX_MODEL_LEN`: 生成数据的上下文长度
 - `CHAT_TEMPLATE_TYPE`: 目标模型的目标类型，目前支持qwen3/qwen2.5/hunyuan/hunyuan-7b
 - `OUTPUT_DIR`: 生成的数据集输出路径
 
@@ -113,7 +113,7 @@ bash scripts/speculative/train_eagle3_vlm_online.sh
 - `TRAIN_DATA_PATH`: 训练数据路径
 - `EVAL_DATA_PATH`: 验证数据路径
 - `OUTPUT_DIR`: Eagle3模型输出路径
-- `MODEL_MAX_LENGTH`: 训练数据的最大长度
+- `MAX_MODEL_LEN`: 训练数据的最大长度
 - `CHAT_TEMPLATE_TYPE`: 目标模型的数据模板类型
 
 ### 2.2 离线训练
@@ -138,7 +138,7 @@ bash scripts/speculative/train_eagle3_vlm_offline.sh
 - `TRAIN_HIDDEN_PATH`: 训练hidden states数据路径
 - `EVAL_HIDDEN_PATH`: 验证hidden states数据路径
 - `OUTPUT_DIR`: Eagle3模型输出路径
-- `MODEL_MAX_LENGTH`: 训练数据的最大长度
+- `MAX_MODEL_LEN`: 训练数据的最大长度
 - `CHAT_TEMPLATE_TYPE`: 目标模型的数据模板类型
 - `LM_HEAD_KEY`: 目标模型lm head的weight key名称，可以在model.safetensors.index.json中查看，默认为lm_head.weight时可不指定这个参数。当为model.embed_tokens.weight时，需要指定。
 - `RUN_NAME`: 当`report_to`设为wand时，可以指定该参数设置wand中的run name。

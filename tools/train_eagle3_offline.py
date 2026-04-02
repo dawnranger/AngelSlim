@@ -176,7 +176,7 @@ def parse_args():
         help="Length of test data for training time",
     )
     training_group.add_argument(
-        "--model_max_length",
+        "--max_model_len",
         type=int,
         default=2048,
         help=(
@@ -348,7 +348,7 @@ def train():
     dataset_manager = DatasetManager(
         data_args=args,
         tokenizer=tokenizer,
-        model_max_length=args.model_max_length,
+        max_model_len=args.max_model_len,
         chat_template_type=args.chat_template_type,
         target_model_type=None if args.modal_type in ("LLM", "TTS") else target_model_type,
     )

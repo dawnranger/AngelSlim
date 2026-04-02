@@ -553,7 +553,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--dataset_path", type=str, nargs="+", required=True, help="Dataset to use"
     )
-    parser.add_argument("--model_max_length", type=int, default=2048, help="Maximum token length")
+    parser.add_argument("--max_model_len", type=int, default=2048, help="Maximum token length")
     parser.add_argument(
         "--chat_template_type",
         type=str,
@@ -633,7 +633,7 @@ def load_dataset(args: argparse.Namespace, tokenizer, rank: int):
         data_args=args,
         tokenizer=tokenizer,
         target_model_type=None if args.modal_type in ("LLM", "TTS") else args.target_model_type,
-        model_max_length=args.model_max_length,
+        max_model_len=args.max_model_len,
         chat_template_type=args.chat_template_type,
         display=display,
     )

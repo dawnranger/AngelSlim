@@ -136,7 +136,7 @@ def parse_arguments() -> argparse.Namespace:
         required=True,
         help="Dataset path",
     )
-    parser.add_argument("--model_max_length", type=int, default=2048, help="Maximum token length")
+    parser.add_argument("--max_model_len", type=int, default=8192, help="Maximum token length")
     parser.add_argument(
         "--chat_template_type",
         type=str,
@@ -170,12 +170,6 @@ def parse_arguments() -> argparse.Namespace:
         type=int,
         default=None,
         help="Total number of GPUs (default: auto-detected)",
-    )
-    parser.add_argument(
-        "--max_model_len",
-        type=int,
-        default=8192,
-        help="vLLM max_model_len",
     )
     parser.add_argument(
         "--gpu_memory_utilization",
@@ -334,7 +328,7 @@ def main():
         data_args=args,
         tokenizer=tokenizer,
         target_model_type=None if args.modal_type in ("LLM", "TTS") else args.target_model_type,
-        model_max_length=args.model_max_length,
+        max_model_len=args.max_model_len,
         chat_template_type=args.chat_template_type,
         display=args.display,
     )

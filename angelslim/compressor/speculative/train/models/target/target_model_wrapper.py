@@ -167,10 +167,10 @@ class _VLMSetupHooksFn:
             norm_module = lm.norm
 
         if norm_module is not None:
-            print_with_rank(
-                f"[VLM] Registering norm hook on {type(norm_module).__name__} "
-                f"(tp_rank={tp_rank})"
-            )
+            # print_with_rank(
+            #     f"[VLM] Registering norm hook on {type(norm_module).__name__} "
+            #     f"(tp_rank={tp_rank})"
+            # )
 
             def vlm_norm_hook(module, args, output):
                 if isinstance(output, tuple):
@@ -1348,12 +1348,12 @@ class VLMVLLMBackend(BaseBackend):
         # for correct logit computation via TargetHead.
         if normed_hidden_states is not None:
             target_hidden_states = normed_hidden_states
-            print_with_rank(
-                f"[VLM] Using normed_hidden_states as target_hiddens, "
-                f"shape={normed_hidden_states.shape}, "
-                f"mean={normed_hidden_states.float().mean().item():.6f}, "
-                f"std={normed_hidden_states.float().std().item():.6f}"
-            )
+            # print_with_rank(
+            #     f"[VLM] Using normed_hidden_states as target_hiddens, "
+            #     f"shape={normed_hidden_states.shape}, "
+            #     f"mean={normed_hidden_states.float().mean().item():.6f}, "
+            #     f"std={normed_hidden_states.float().std().item():.6f}"
+            # )
         else:
             print_with_rank(
                 "[VLM] WARNING: normed_hidden_states not available from vLLM hook. "

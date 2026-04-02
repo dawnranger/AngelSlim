@@ -128,7 +128,7 @@ def parse_args():
         default="qwen3",
         help=f"Supported: {', '.join(get_supported_chat_template_type_strings())}",
     )
-    da.add_argument("--model_max_length", type=int, default=3072)
+    da.add_argument("--max_model_len", type=int, default=3072)
     da.add_argument("--num_proc", type=int, default=16)
     da.add_argument(
         "--cache_in_memory",

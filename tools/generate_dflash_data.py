@@ -9,7 +9,7 @@
 #       --draft_model_config_path configs/qwen3_dflash.json \
 #       --train_data_path /path/to/data.jsonl \
 #       --output_dir /path/to/output/ckpts \
-#       --model_max_length 3072 \
+#       --max_model_len 3072 \
 #       --chat_template_type qwen3
 #
 # Each output .ckpt file contains:
@@ -72,7 +72,7 @@ def parse_args():
         default="qwen3",
         help=f"Supported: {', '.join(get_supported_chat_template_type_strings())}",
     )
-    parser.add_argument("--model_max_length", type=int, default=3072)
+    parser.add_argument("--max_model_len", type=int, default=3072)
     parser.add_argument(
         "--block_size", type=int, default=16, help="Block size for DFlash parallel prediction"
     )
@@ -173,7 +173,7 @@ def main():
     dataset_manager = DatasetManager(
         data_args=args,
         tokenizer=tokenizer,
-        model_max_length=args.model_max_length,
+        max_model_len=args.max_model_len,
         chat_template_type=args.chat_template_type,
     )
 

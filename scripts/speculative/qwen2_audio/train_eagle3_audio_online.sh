@@ -7,7 +7,7 @@ export TRAIN_DATA_PATH=
 export EVAL_DATA_PATH=
 export OUTPUT_DIR=
 export EMBED_WEIGHT_KEY="language_model.model.embed_tokens.weight"
-export MODEL_MAX_LENGTH=4096
+export MAX_MODEL_LEN=4096
 export CHAT_TEMPLATE_TYPE=qwen2_audio
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
@@ -32,7 +32,7 @@ torchrun --nproc_per_node=8 tools/train_eagle3_online.py \
     --warmup_ratio 0.1 \
     --lr_scheduler_type "constant" \
     --logging_steps 20 \
-    --model_max_length $MODEL_MAX_LENGTH \
+    --max_model_len $MAX_MODEL_LEN \
     --embed_weight_key $EMBED_WEIGHT_KEY \
     --deepspeed $CONFIG_DIR/deepspeed_zero3.json \
     --chat_template_type $CHAT_TEMPLATE_TYPE \

@@ -15,7 +15,7 @@ set -x
 TARGET_MODEL_PATH=
 TRAIN_DATASET_PATH=
 TRAIN_HIDDEN_PATH=
-MODEL_MAX_LENGTH=8192
+MAX_MODEL_LEN=8192
 # Set defaults
 SAMPLE_NUM=50000
 CHAT_TEMPLATE_TYPE=
@@ -162,7 +162,7 @@ if [ "$NODE_RANK" -eq "0" ]; then
         --draft_model_config_path $DRAFT_MODEL_CONFIG_PATH \
         --target_backend vllm \
         --torch_dtype bfloat16 \
-        --model_max_length $MODEL_MAX_LENGTH \
+        --max_model_len $MAX_MODEL_LEN \
         --outdir $TRAIN_HIDDEN_PATH \
         --num_proc 16 \
         --sample_num $SAMPLE_NUM \

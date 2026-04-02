@@ -6,7 +6,7 @@ export DRAFT_MODEL_CONFIG_PATH=$CONFIG_DIR/qwen3-vl-4b-eagle3-mrope.json
 export TRAIN_DATA_PATH=
 export EVAL_DATA_PATH=
 export OUTPUT_DIR=
-export MODEL_MAX_LENGTH=2048
+export MAX_MODEL_LEN=2048
 export CHAT_TEMPLATE_TYPE=qwen3_vl
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
@@ -28,7 +28,7 @@ torchrun --nproc_per_node=8 tools/train_eagle3_online.py \
     --warmup_ratio 0.1 \
     --lr_scheduler_type "constant" \
     --logging_steps 20 \
-    --model_max_length $MODEL_MAX_LENGTH \
+    --max_model_len $MAX_MODEL_LEN \
     --deepspeed $CONFIG_DIR/deepspeed_zero3.json \
     --chat_template_type $CHAT_TEMPLATE_TYPE \
     --report_to none \

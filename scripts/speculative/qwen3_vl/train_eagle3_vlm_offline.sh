@@ -7,7 +7,7 @@ TRAIN_HIDDEN_PATH=
 EVAL_HIDDEN_PATH=
 OUTPUT_DIR=
 RUN_NAME=qwen3-4b-eagle3-angelslim
-MODEL_MAX_LENGTH=8192
+MAX_MODEL_LEN=8192
 export MAX_PIXELS=
 
 torchrun --nproc_per_node=8 tools/train_eagle3_offline.py \
@@ -30,7 +30,7 @@ torchrun --nproc_per_node=8 tools/train_eagle3_offline.py \
     --warmup_ratio 0.1 \
     --lr_scheduler_type "constant" \
     --logging_steps 100 \
-    --model_max_length $MODEL_MAX_LENGTH \
+    --max_model_len $MAX_MODEL_LEN \
     --deepspeed $CONFIG_DIR/deepspeed_zero3.json \
     --report_to none \
     --run_name $RUN_NAME \

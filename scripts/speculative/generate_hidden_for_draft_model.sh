@@ -3,7 +3,7 @@
 DATASET_PATH=
 MODEL_NAME=
 TARGET_BACKEND=hf
-MODEL_MAX_LENGTH=2048
+MAX_MODEL_LEN=2048
 CHAT_TEMPLATE_TYPE=qwen3
 OUTPUT_DIR=
 
@@ -13,6 +13,6 @@ torchrun --nproc_per_node=8 \
     --model_name $MODEL_NAME \
     --target_backend $TARGET_BACKEND \
     --torch_dtype bfloat16 \
-    --model_max_length $MODEL_MAX_LENGTH \
+    --max_model_len $MAX_MODEL_LEN \
     --chat_template_type $CHAT_TEMPLATE_TYPE \
     --outdir $OUTPUT_DIR
