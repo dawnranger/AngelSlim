@@ -353,17 +353,18 @@ class LlamaAttention(nn.Module):
 
         lck = len(cache_k)
 
+        # cuDNN SDPA backend (PyTorch 2.7+) does not support arbitrary 4D
+        # float attention masks and will fail during backward with:
+        #   "Expected mha_graph->execute(...).is_good() to be true"
+        # Disable cuDNN backend so that Flash Attention / math backends
+        # handle the 4D causal mask correctly.
+        _sdpa_backends = [
+            torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+            torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+            torch.nn.attention.SDPBackend.MATH,
+        ]
+
         if lck == 1:
-            # cuDNN SDPA backend (PyTorch 2.7+) does not support arbitrary 4D
-            # float attention masks and will fail during backward with:
-            #   "Expected mha_graph->execute(...).is_good() to be true"
-            # Disable cuDNN backend so that Flash Attention / math backends
-            # handle the 4D causal mask correctly.
-            _sdpa_backends = [
-                torch.nn.attention.SDPBackend.FLASH_ATTENTION,
-                torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
-                torch.nn.attention.SDPBackend.MATH,
-            ]
             with torch.nn.attention.sdpa_kernel(_sdpa_backends):
                 attn_output = torch.nn.functional.scaled_dot_product_attention(
                     query_states, k0, v0, attn_mask=attention_mask
@@ -374,32 +375,82 @@ class LlamaAttention(nn.Module):
             new_past_key_value = [local_cache_k, local_cache_v]
             return attn_output, new_past_key_value
 
-        attn_weights = torch.matmul(query_states, k0.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # lck > 1: Use Flash Attention for k0/v0 to avoid explicitly constructing
+        # the [bsz, heads, q_len, q_len] attn_weights matrix (which causes OOM on
+        # long sequences), then merge the cache part via online softmax.
+        #
+        # Idea: split attention into two parts
+        #   Part A: causal attention of query against k0/v0 (computed via Flash Attention)
+        #   Part B: attention of query against cache_k[1..lck-1] (each cache has only 1 token)
+        # Merge the two parts using online softmax:
+        #   output = (exp(lse_A) * out_A + sum_i(exp(s_i) * v_i)) / (exp(lse_A) + sum_i(exp(s_i)))
 
-        attn_weights = attn_weights + attention_mask
+        # Part A: Flash Attention on k0/v0, get output and log-sum-exp
+        with torch.nn.attention.sdpa_kernel(_sdpa_backends):
+            # scale_factor to keep consistent scaling with Part B scores
+            scale = 1.0 / math.sqrt(self.head_dim)
+            # scaled_dot_product_attention already applies scale internally, call directly
+            attn_out_A = torch.nn.functional.scaled_dot_product_attention(
+                query_states, k0, v0, attn_mask=attention_mask
+            )
+            # Compute log-sum-exp in chunks to avoid materializing the full
+            # [bsz, heads, q_len, kv_len] attention score matrix at once (OOM on
+            # long sequences). Split q_len into chunks, each constructing only a
+            # [bsz, heads, chunk_size, kv_len] score matrix.
+            _LSE_CHUNK_SIZE = 1024
+            k0_t_float = k0.float().transpose(2, 3)  # [bsz, heads, head_dim, kv_len]
+            lse_A_chunks = []
+            for _c_start in range(0, q_len, _LSE_CHUNK_SIZE):
+                _c_end = min(_c_start + _LSE_CHUNK_SIZE, q_len)
+                # [bsz, heads, chunk_size, kv_len]
+                _q_chunk = query_states[:, :, _c_start:_c_end, :].float()
+                _scores_chunk = torch.matmul(_q_chunk, k0_t_float) * scale
+                if attention_mask is not None:
+                    _scores_chunk = (
+                        _scores_chunk + attention_mask[:, :, _c_start:_c_end, :].float()
+                    )
+                # [bsz, heads, chunk_size]
+                lse_A_chunks.append(torch.logsumexp(_scores_chunk, dim=-1))
+                del _scores_chunk, _q_chunk
+            # lse_A: [bsz, heads, q_len]
+            lse_A = torch.cat(lse_A_chunks, dim=-1)
+            del lse_A_chunks, k0_t_float
+
+        # Part B: compute scalar attention score for each cache token
+        # cache_k[i] shape: [bsz, heads, 1, head_dim] (single token)
+        # attn score: (query . k_i) / sqrt(head_dim), shape [bsz, heads, q_len]
+        cache_scores = []
+        for i in range(1, lck):
+            ki = cache_k[i]  # [bsz, heads, 1, head_dim]
+            # dot product: [bsz, heads, q_len, head_dim] * [bsz, heads, head_dim, 1]
+            #   -> [bsz, heads, q_len]
+            si = (query_states.float() * ki.float()).sum(-1) * scale  # [bsz, heads, q_len]
+            cache_scores.append(si)
+
+        # Online softmax merge:
+        # Stack all scores, compute logsumexp, then derive individual weights
+        # cache_scores_stack: [bsz, heads, q_len, lck-1]
+        cache_scores_stack = torch.stack(cache_scores, dim=-1)
+        # lse_B: [bsz, heads, q_len]
+        lse_B = torch.logsumexp(cache_scores_stack, dim=-1)
+
+        # Combine lse_A and lse_B to get the global log-sum-exp
+        lse_all = torch.logaddexp(lse_A, lse_B)  # [bsz, heads, q_len]
+
+        # Weight coefficient for Part A: exp(lse_A - lse_all)
+        w_A = torch.exp(lse_A - lse_all).to(query_states.dtype)  # [bsz, heads, q_len]
+
+        # Weight for each Part B cache token: exp(s_i - lse_all)
+        # Initialize attn_output with the weighted output of Part A
+        attn_output = attn_out_A * w_A[..., None]  # [bsz, heads, q_len, head_dim]
 
         for i in range(1, lck):
-            ki = cache_k[i]
-
-            qi = query_states
-            kiq = ki
-
-            attn_weightsi = (qi * kiq).sum(-1) / math.sqrt(self.head_dim)
-            attn_weights = torch.cat((attn_weights, attn_weightsi[..., None]), dim=-1)
-
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
-            query_states.dtype
-        )
-        attn_weights0 = attn_weights[..., :q_len]
-
-        attn_output = torch.matmul(attn_weights0, v0)
-
-        for i in range(1, lck):
-            vi = cache_v[i]
-            attn_weightsi = attn_weights[..., q_len + i - 1]
-            attn_outputi = attn_weightsi[..., None] * vi
-            attn_output = attn_output + attn_outputi
+            vi = cache_v[i]  # [bsz, heads, 1, head_dim]
+            si = cache_scores[i - 1]  # [bsz, heads, q_len]
+            w_i = torch.exp(si - lse_all).to(query_states.dtype)  # [bsz, heads, q_len]
+            attn_output = (
+                attn_output + w_i[..., None] * vi
+            )  # broadcast vi: [bsz, heads, 1, head_dim]
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, -1)
