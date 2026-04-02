@@ -364,10 +364,18 @@ class LlamaAttention(nn.Module):
             torch.nn.attention.SDPBackend.MATH,
         ]
 
+        # When attention_mask is None, use is_causal=True for SDPA so that
+        # Flash Attention uses its built-in efficient causal mask (no extra memory).
+        _use_causal = attention_mask is None
+
         if lck == 1:
             with torch.nn.attention.sdpa_kernel(_sdpa_backends):
                 attn_output = torch.nn.functional.scaled_dot_product_attention(
-                    query_states, k0, v0, attn_mask=attention_mask
+                    query_states,
+                    k0,
+                    v0,
+                    attn_mask=attention_mask,
+                    is_causal=_use_causal,
                 )
             attn_output = attn_output.transpose(1, 2).contiguous()
             attn_output = attn_output.reshape(bsz, q_len, -1)
@@ -391,7 +399,11 @@ class LlamaAttention(nn.Module):
             scale = 1.0 / math.sqrt(self.head_dim)
             # scaled_dot_product_attention already applies scale internally, call directly
             attn_out_A = torch.nn.functional.scaled_dot_product_attention(
-                query_states, k0, v0, attn_mask=attention_mask
+                query_states,
+                k0,
+                v0,
+                attn_mask=attention_mask,
+                is_causal=_use_causal,
             )
             # Compute log-sum-exp in chunks to avoid materializing the full
             # [bsz, heads, q_len, kv_len] attention score matrix at once (OOM on
@@ -409,6 +421,18 @@ class LlamaAttention(nn.Module):
                 _scores_chunk = torch.matmul(_q_chunk, k0_t) * scale
                 if attention_mask is not None:
                     _scores_chunk = _scores_chunk + attention_mask[:, :, _c_start:_c_end, :]
+                else:
+                    # Apply causal mask: for each query position i, mask out
+                    # key positions j > i by setting score to -inf.
+                    # _chunk_len = _c_end - _c_start
+                    # causal_mask: [chunk_size, kv_len], True where j <= i
+                    _row_idx = torch.arange(_c_start, _c_end, device=_scores_chunk.device)
+                    _col_idx = torch.arange(q_len, device=_scores_chunk.device)
+                    _causal = _col_idx[None, :] <= _row_idx[:, None]  # [chunk_size, kv_len]
+                    _scores_chunk = _scores_chunk.masked_fill(
+                        ~_causal[None, None, :, :], float("-inf")
+                    )
+                    del _causal, _row_idx, _col_idx
                 # [bsz, heads, chunk_size] - only logsumexp in float32
                 lse_A_chunks.append(torch.logsumexp(_scores_chunk.float(), dim=-1))
                 del _scores_chunk, _q_chunk

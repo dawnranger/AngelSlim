@@ -185,6 +185,11 @@ class Eagle3Trainer(Trainer, ABC):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Prepare attention mask for draft model training.
+
+        When all tokens are valid (attention_mask is all-ones), returns None
+        so that SDPA can use its built-in efficient causal mask implementation
+        (Flash Attention / memory-efficient attention) instead of materializing
+        a full [bsz, 1, seq_len, seq_len] mask tensor.
         """
         # Step 5: Prepare attention mask and position IDs
         batch_size, seq_length, _ = hidden_states.shape
@@ -200,8 +205,11 @@ class Eagle3Trainer(Trainer, ABC):
             else:
                 position_ids = position_ids.view(-1, seq_length).long()
 
-        if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_length), dtype=torch.bool, device=device)
+        # When attention_mask is all-ones (no padding), return None to let
+        # SDPA use its built-in causal mask (avoids allocating a
+        # [bsz, 1, seq_len, seq_len] tensor).
+        if attention_mask is None or attention_mask.all():
+            return None, position_ids
 
         attention_mask = self.draft_model.prepare_decoder_attention_mask(
             attention_mask, (batch_size, seq_length), hidden_states, 0
@@ -225,10 +233,42 @@ class Eagle3Trainer(Trainer, ABC):
         plosses, acces = [], []
         cache_hidden = [[], []]
 
+        # Pre-compute target distribution outside the loop to avoid
+        # redundant t2d gather + softmax (each is expensive on full vocab).
+        # Build a list of (target_p, position_mask, target_p_argmax) for each iteration,
+        # applying the padding shift incrementally.
+        t2d = self.draft_model.t2d
+        precomputed_targets = []
+        _tl = target_logits
+        _lm = loss_mask
+        _ids = input_ids
+        for idx in range(self.length):
+            with torch.no_grad():
+                target_max_token = _tl.argmax(-1)
+                target_mask = t2d[target_max_token][..., None].int()
+                position_mask = target_mask * _lm
+                target_head = _tl[..., t2d].float()
+                target_p = nn.Softmax(dim=2)(target_head).detach()
+                target_p_argmax = target_p.argmax(-1)
+            precomputed_targets.append((target_p, position_mask, target_p_argmax, _lm, _ids))
+            if idx < self.length - 1:
+                _tl = padding(_tl, left=False)
+                _lm = padding(_lm, left=False)
+                _ids = padding(_ids, left=False)
+        del _tl, _lm, _ids, target_logits
+
         # Step 7: Iterative speculative decoding training loop
         for idx in range(self.length):
+            target_p, position_mask, target_p_argmax, cur_loss_mask, cur_input_ids = (
+                precomputed_targets[idx]
+            )
+
             # Step 7.1: Get input embeddings with gradient tracking
-            inputs_embeds = self.draft_model.embed_input_ids(input_ids)
+            if idx == 0:
+                cur_input_ids_for_embed = input_ids
+            else:
+                cur_input_ids_for_embed = cur_input_ids
+            inputs_embeds = self.draft_model.embed_input_ids(cur_input_ids_for_embed)
             if not inputs_embeds.requires_grad:
                 inputs_embeds.requires_grad = True
 
@@ -260,33 +300,18 @@ class Eagle3Trainer(Trainer, ABC):
             # Step 7.3: Compute logits from hidden states
             logits = self.draft_model.compute_logits(hidden_states)
 
-            # Step 7.4: Compute target distribution and position mask
-            with torch.no_grad():
-                target_max_token = target_logits.argmax(-1)
-                target_mask = self.draft_model.t2d[target_max_token][..., None].int()
-                position_mask = target_mask * loss_mask
-
-                target_head = target_logits[..., self.draft_model.t2d].float()
-                target_p = nn.Softmax(dim=2)(target_head).detach()
-
-            # Step 7.5: Compute loss
+            # Step 7.5: Compute loss (target_p and position_mask are pre-computed)
             out_logp = nn.LogSoftmax(dim=2)(logits)
             loss = -torch.sum(position_mask * target_p * out_logp, dim=2).mean()
 
             # Step 7.6: Compute accuracy
             with torch.no_grad():
-                correct = (logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)
-                accuracy = correct.sum().item() / (loss_mask.sum().item() + 1e-6)
+                correct = (logits.argmax(-1) == target_p_argmax) * position_mask.squeeze(-1)
+                accuracy = correct.sum().item() / (cur_loss_mask.sum().item() + 1e-6)
 
             # Step 7.7: Store loss and accuracy
             plosses.append(loss)
             acces.append(accuracy)
-
-            # Step 7.8: Update inputs for next iteration (skip on last step)
-            if idx < self.length - 1:
-                input_ids = padding(input_ids, left=False)
-                target_logits = padding(target_logits, left=False)
-                loss_mask = padding(loss_mask, left=False)
 
         # Step 8: Compute weighted loss
         ploss_weight = [0.8**i for i in range(len(plosses))]

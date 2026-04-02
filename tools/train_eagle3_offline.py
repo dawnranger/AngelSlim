@@ -420,6 +420,12 @@ def train():
         "gradient_checkpointing": args.gradient_checkpointing,
     }
 
+    # prefetch data
+    dataloader_args = {
+        "dataloader_num_workers": 4,
+        "dataloader_prefetch_factor": 2,
+    }
+
     training_args = transformers.TrainingArguments(
         **basic_args,
         **batch_args,
@@ -428,6 +434,7 @@ def train():
         **checkpoint_args,
         **logging_args,
         **distributed_args,
+        **dataloader_args,
         remove_unused_columns=False,
     )
 
