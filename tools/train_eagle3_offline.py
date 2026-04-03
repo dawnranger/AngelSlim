@@ -290,6 +290,23 @@ def parse_args():
         ),
     )
 
+    # DataLoader arguments
+    dataloader_group = parser.add_argument_group("DataLoader Arguments")
+    dataloader_group.add_argument(
+        "--dataloader_num_workers",
+        type=int,
+        default=8,
+        help="Number of subprocesses for data loading. "
+        "Too many workers may cause CPU memory explosion (OOM). (default: 8)",
+    )
+    dataloader_group.add_argument(
+        "--dataloader_prefetch_factor",
+        type=int,
+        default=8,
+        help="Number of batches loaded in advance by each worker. "
+        "Higher values consume more CPU memory but reduce data loading stalls. (default: 8)",
+    )
+
     return parser.parse_args()
 
 
@@ -463,8 +480,8 @@ def train():
     # prefetch data
     # Too many workers may cause CPU memory explosion (OOM).
     dataloader_args = {
-        "dataloader_num_workers": 8,
-        "dataloader_prefetch_factor": 8,
+        "dataloader_num_workers": args.dataloader_num_workers,
+        "dataloader_prefetch_factor": args.dataloader_prefetch_factor,
     }
 
     training_args = transformers.TrainingArguments(
