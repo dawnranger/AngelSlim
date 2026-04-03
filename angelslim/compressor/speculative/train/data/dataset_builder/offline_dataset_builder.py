@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
@@ -199,6 +202,132 @@ class OfflineEagle3Dataset(Dataset):
             raise RuntimeError(f"Failed to load any valid checkpoint after {max_retries} attempts")
 
 
+class MemmapOfflineEagle3Dataset(Dataset):
+    """
+    Offline Dataset that reads from packed numpy memmap files.
+
+    Packed format: Data is tightly concatenated without padding.
+    - metadata.json contains "format": "packed"
+    - offsets.npy: int64 array of length (total_samples + 1), cumulative token boundaries
+    - Each field .npy has shape (total_tokens, *extra_dims) — no wasted space
+    - Sample i occupies [offsets[i], offsets[i+1]) in the packed array
+
+    Supports both single-directory and multi-rank directory layouts:
+    - Single: <data_dir>/memmap_data/metadata.json
+    - Multi-rank: <data_dir>/rank_*/memmap_data/metadata.json
+
+    Advantages:
+    1. Zero deserialization: Direct memory mapping, no pickle deserialization needed
+    2. On-demand loading: OS loads 4KB pages on demand, only reading accessed samples
+    3. Multi-process sharing: Multiple DataLoader workers share the same mmap page cache
+    4. No merge needed: Sampling phase writes directly to memmap, training phase reads directly
+    5. Zero padding waste: Storage size equals sum of actual sequence lengths
+    """
+
+    def __init__(self, memmap_dirs: list):
+        """
+        Initialize the MemmapOfflineEagle3Dataset.
+
+        Args:
+            memmap_dirs: List of directories containing memmap files and metadata.json
+        """
+        self.memmap_dirs = memmap_dirs
+
+        # Load memmap files from all directories and build global index
+        # global_index[i] = (dir_idx, local_sample_idx)
+        self.global_index = []
+        self._dir_memmaps = []  # [{field_name: np.memmap}, ...]
+        self._dir_offsets = []  # [np.memmap, ...]
+        self._dir_metadata = []  # [metadata_dict, ...]
+
+        total_samples = 0
+        for dir_idx, memmap_dir in enumerate(memmap_dirs):
+            metadata_path = os.path.join(memmap_dir, "metadata.json")
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+
+            self._dir_metadata.append(metadata)
+            n_samples = metadata["total_samples"]
+
+            # Open memmap files (read-only mode)
+            field_memmaps = {}
+            for field_name, field_info in metadata["fields"].items():
+                if field_name == "offsets":
+                    continue
+                memmap_path = os.path.join(memmap_dir, f"{field_name}.npy")
+                if not os.path.exists(memmap_path):
+                    warnings.warn(
+                        f"Memmap file not found: {memmap_path}, skipping field {field_name}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    continue
+                field_memmaps[field_name] = np.memmap(
+                    memmap_path,
+                    dtype=field_info["dtype"],
+                    mode="r",
+                    shape=tuple(field_info["shape"]),
+                )
+            self._dir_memmaps.append(field_memmaps)
+
+            # Load offsets
+            offsets_path = os.path.join(memmap_dir, "offsets.npy")
+            offsets_info = metadata["fields"]["offsets"]
+            offsets = np.memmap(
+                offsets_path,
+                dtype=offsets_info["dtype"],
+                mode="r",
+                shape=tuple(offsets_info["shape"]),
+            )
+            self._dir_offsets.append(offsets)
+
+            # Build global index
+            for local_idx in range(n_samples):
+                self.global_index.append((dir_idx, local_idx))
+
+            total_samples += n_samples
+            rank0_print(
+                f"[MemmapDataset] Dir {dir_idx}: {memmap_dir} "
+                f"({n_samples} samples, {metadata.get('total_tokens', 'N/A')} total tokens)"
+            )
+
+        self.total_samples = total_samples
+
+        rank0_print(
+            f"[MemmapDataset] Loaded {self.total_samples} samples "
+            f"from {len(memmap_dirs)} memmap directories"
+        )
+
+    def __len__(self) -> int:
+        return self.total_samples
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        dir_idx, local_idx = self.global_index[idx]
+        field_memmaps = self._dir_memmaps[dir_idx]
+        offsets = self._dir_offsets[dir_idx]
+        start = int(offsets[local_idx])
+        end = int(offsets[local_idx + 1])
+
+        data = {}
+        for field_name, mm in field_memmaps.items():
+            # mm shape: (total_tokens, *extra_dims)
+            # Read slice [start:end, ...] for this sample
+            arr = mm[start:end]  # [seq_len, ...] or [seq_len]
+
+            # np.memmap returns a view, copy is needed to convert to tensor
+            tensor = torch.from_numpy(arr.copy())
+
+            # Add batch dimension [1, seq_len, ...]
+            tensor = tensor.unsqueeze(0)
+            data[field_name] = tensor
+
+        # Generate attention_mask
+        if "input_ids" in data:
+            data["attention_mask"] = torch.ones_like(data["input_ids"])
+
+        return data
+
+
 class OfflineVLMEagle3Dataset(OfflineEagle3Dataset):
     def _load_ckpt(self, idx: int) -> Optional[Dict[str, torch.Tensor]]:
         """
@@ -277,13 +406,62 @@ class OfflineLLMDatasetBuilder(DatasetBuilder):
 
     def build_dataset(self, datapath: str, **kwargs: Any) -> Dataset:
         """
-        Create offline datasets from pre-computed .ckpt files.
+        Create offline datasets from pre-computed files.
+
+        Automatically detects data format in the following order:
+        1. memmap format: <datapath>/memmap_data/metadata.json
+            or <datapath>/rank_*/memmap_data/metadata.json
+        2. Falls back to individual .ckpt files if no memmap format found.
         """
+        # Detect memmap format
+        memmap_dirs = self._find_memmap_dirs(datapath)
+        if memmap_dirs:
+            rank0_print(
+                f"[IO-Optimized] Found {len(memmap_dirs)} memmap dir(s), "
+                f"using MemmapOfflineEagle3Dataset for zero-copy IO"
+            )
+            return MemmapOfflineEagle3Dataset(memmap_dirs=memmap_dirs)
+
+        # Fall back to individual .ckpt files
+        rank0_print(
+            f"[IO] No memmap data found under {datapath}, "
+            f"falling back to individual .ckpt files."
+        )
         return OfflineEagle3Dataset(
             data_dir=datapath,
             file_pattern=self.file_pattern,
             cache_in_memory=self.cache_in_memory,
         )
+
+    @staticmethod
+    def _find_memmap_dirs(datapath: str) -> list:
+        """
+        Find all memmap data directories under datapath.
+
+        Checks:
+        1. <datapath>/memmap_data/metadata.json
+        2. <datapath>/rank_*/memmap_data/metadata.json
+
+        Returns:
+            List of memmap directory paths, or empty list if none found.
+        """
+        memmap_dirs = []
+
+        # Check single directory layout
+        single_dir = os.path.join(datapath, "memmap_data")
+        if os.path.exists(os.path.join(single_dir, "metadata.json")):
+            memmap_dirs.append(single_dir)
+            return memmap_dirs
+
+        # Check multi-rank directory layout
+        if os.path.isdir(datapath):
+            for entry in sorted(os.listdir(datapath)):
+                if entry.startswith("rank_"):
+                    rank_memmap = os.path.join(datapath, entry, "memmap_data")
+                    if os.path.exists(os.path.join(rank_memmap, "metadata.json")):
+                        memmap_dirs.append(rank_memmap)
+
+        return memmap_dirs
 
     def get_data_collator(self) -> Any:
         return DataCollatorWithPadding()
@@ -298,8 +476,18 @@ class OfflineVLMDatasetBuilder(DatasetBuilder):
 
     def build_dataset(self, datapath: str, **kwargs: Any) -> Dataset:
         """
-        Create offline datasets from pre-computed .ckpt files.
+        Create offline datasets from pre-computed files.
+
+        Automatically detects data format: memmap > individual .ckpt.
         """
+        memmap_dirs = OfflineLLMDatasetBuilder._find_memmap_dirs(datapath)
+        if memmap_dirs:
+            rank0_print(
+                f"[IO-Optimized] Found {len(memmap_dirs)} memmap dir(s), "
+                f"using MemmapOfflineEagle3Dataset for zero-copy IO"
+            )
+            return MemmapOfflineEagle3Dataset(memmap_dirs=memmap_dirs)
+
         return OfflineVLMEagle3Dataset(
             data_dir=datapath,
             file_pattern=self.file_pattern,
@@ -318,8 +506,18 @@ class OfflineVLMHunyuanVLDatasetBuilder(DatasetBuilder):
 
     def build_dataset(self, datapath: str, **kwargs: Any) -> Dataset:
         """
-        Create offline datasets from pre-computed .ckpt files.
+        Create offline datasets from pre-computed files.
+
+        Automatically detects data format: memmap > individual .ckpt.
         """
+        memmap_dirs = OfflineLLMDatasetBuilder._find_memmap_dirs(datapath)
+        if memmap_dirs:
+            rank0_print(
+                f"[IO-Optimized] Found {len(memmap_dirs)} memmap dir(s), "
+                f"using MemmapOfflineEagle3Dataset for zero-copy IO"
+            )
+            return MemmapOfflineEagle3Dataset(memmap_dirs=memmap_dirs)
+
         return OfflineVLMEagle3Dataset(
             data_dir=datapath,
             file_pattern=self.file_pattern,

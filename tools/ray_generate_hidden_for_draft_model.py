@@ -359,6 +359,16 @@ def main():
     # (Dataset was already loaded and preprocessed above)
     dataset_ref = ray.put(dataset)
 
+    # Release the dataset reference in Driver process to free memory.
+    # The dataset is now in Ray Object Store and will be sent to workers
+    # via dataset_ref. Keeping it in Driver wastes memory (especially for
+    # VLM datasets with base64-encoded images) and can cause OOM when
+    # ray.get() later needs memory for deserializing worker results.
+    del dataset
+    import gc
+
+    gc.collect()
+
     # ==========================================
     # Define Ray Worker Actor
     # ==========================================

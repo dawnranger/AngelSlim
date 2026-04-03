@@ -21,6 +21,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from tqdm import tqdm
@@ -78,7 +79,6 @@ class HiddenStateGenerator:
         self,
         target_model,
         output_dir: str,
-        group_size: int = 5000,
         rank: int = 0,
         draft_vocab_size: int = None,
         target_vocab_size: int = None,
@@ -89,14 +89,12 @@ class HiddenStateGenerator:
         Args:
             target_model: The target model for generating hidden states
             output_dir: Directory to save generated hidden states
-            group_size: Number of samples per subdirectory group
             rank: Process rank for distributed training
             draft_vocab_size: Size of draft model vocabulary (required for vocab mapping)
             target_vocab_size: Size of target model vocabulary (required for vocab mapping)
         """
         self.target_model = target_model
         self.output_dir = Path(output_dir)
-        self.group_size = group_size
         self.rank = rank
         self.draft_vocab_size = draft_vocab_size
         self.target_vocab_size = target_vocab_size
@@ -106,6 +104,20 @@ class HiddenStateGenerator:
         self.min_pixels = int(_min_pixels) if _min_pixels is not None else None
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.token_dict = Counter()
+
+        # Packed memmap: Tightly concatenate all samples' data (no padding waste)
+        # Each field is stored as a 1D (or 2D for hidden dims) packed array.
+        # An offsets array records the cumulative token count for each sample.
+        self._memmap_dir = self.output_dir / "memmap_data"
+        self._memmap_dir.mkdir(parents=True, exist_ok=True)
+        self._memmap_files = {}  # {field_name: np.memmap}
+        self._memmap_initialized = False
+        self._sample_count = 0
+        self._total_tokens_written = 0  # Total tokens written across all samples
+        self._preallocated_token_capacity = 0  # Preallocated total token capacity
+        self._preallocated_sample_capacity = 0  # Preallocated sample capacity
+        self._field_extra_dims = {}  # {field_name: tuple of extra dims after seq_len}
+        self._field_dtypes = {}  # {field_name: numpy dtype}
 
         # Resolve image_pad token id for vLLM loss_mask rebuilding
         self._image_pad_token_id = None
@@ -250,23 +262,297 @@ class HiddenStateGenerator:
         new_loss_mask = torch.tensor(new_mask_list, dtype=orig_loss_mask.dtype)
         return new_input_ids, new_loss_mask
 
-    def _get_output_path(self, idx: int) -> Path:
-        """
-        Get the output file path for a given sample index.
+    def _init_memmap(self, data_point: Dict[str, torch.Tensor], total_samples: int):
+        """Initialize packed memmap files based on the shape info of the first sample.
+
+        Packed layout: each field is stored as a flat concatenation of all samples'
+        valid tokens. An offsets array (length = total_samples + 1) records the
+        cumulative token boundary so that sample i occupies
+        [offsets[i], offsets[i+1]) in the packed array.
+
+        This eliminates all padding waste — storage equals the sum of actual
+        sequence lengths, identical to the old torch.save/shard approach.
 
         Args:
-            idx: Sample index
-
-        Returns:
-            Path object for the output file
+            data_point: First sample data
+            total_samples: Estimated total number of samples (for preallocation)
         """
-        start = (idx // self.group_size) * self.group_size
-        end = start + self.group_size
-        grouped_subdir = f"rows_{start}-{end}"
-        grouped_path = self.output_dir / grouped_subdir
-        grouped_path.mkdir(parents=True, exist_ok=True)
+        # Estimate average seq_len from the first sample to preallocate token capacity
+        first_seq_len = 0
+        for field_name, tensor in data_point.items():
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            per_sample_shape = tensor.shape[1:]  # (N, ...) or (N,)
+            first_seq_len = max(first_seq_len, per_sample_shape[0])
+            extra_dims = per_sample_shape[1:]  # () or (D,) or (3*D,)
 
-        return grouped_path / f"data_{idx}.ckpt"
+            # Determine numpy dtype
+            if tensor.dtype == torch.bfloat16:
+                np_dtype = np.float16
+            elif tensor.dtype == torch.float16:
+                np_dtype = np.float16
+            elif tensor.dtype == torch.float32:
+                np_dtype = np.float32
+            elif tensor.dtype in (torch.int64, torch.long):
+                np_dtype = np.int64
+            elif tensor.dtype in (torch.int32, torch.int):
+                np_dtype = np.int32
+            else:
+                np_dtype = np.float32
+
+            self._field_dtypes[field_name] = np_dtype
+            self._field_extra_dims[field_name] = tuple(extra_dims)
+
+        # Preallocate: assume avg seq_len ≈ first sample's seq_len, with 1.2x margin
+        self._preallocated_sample_capacity = int(total_samples * 1.1) + 10
+        self._preallocated_token_capacity = int(first_seq_len * total_samples * 1.2) + 1024
+
+        # Create packed memmap files: shape = (total_tokens, *extra_dims)
+        for field_name in self._field_dtypes:
+            extra_dims = self._field_extra_dims[field_name]
+            packed_shape = (self._preallocated_token_capacity,) + extra_dims
+            memmap_path = self._memmap_dir / f"{field_name}.npy"
+            self._memmap_files[field_name] = np.memmap(
+                str(memmap_path),
+                dtype=self._field_dtypes[field_name],
+                mode="w+",
+                shape=packed_shape,
+            )
+
+        # Offsets array: offsets[i] = cumulative token count before sample i
+        # Length = preallocated_sample_capacity + 1 (offsets[0] = 0)
+        self._offsets = np.memmap(
+            str(self._memmap_dir / "offsets.npy"),
+            dtype=np.int64,
+            mode="w+",
+            shape=(self._preallocated_sample_capacity + 1,),
+        )
+        self._offsets[0] = 0
+
+        self._memmap_initialized = True
+        logger.info(
+            f"Packed memmap initialized: sample_capacity={self._preallocated_sample_capacity}, "
+            f"token_capacity={self._preallocated_token_capacity}, "
+            f"fields={list(self._field_dtypes.keys())}, "
+            f"dir={self._memmap_dir}",
+            extra={"rank": self.rank},
+        )
+
+    def _expand_token_capacity(self, required_tokens: int):
+        """Expand packed memmap token capacity when running out of space."""
+        old_capacity = self._preallocated_token_capacity
+        self._preallocated_token_capacity = max(int(old_capacity * 1.5), required_tokens + 1024)
+
+        logger.info(
+            f"Expanding packed memmap token capacity: {old_capacity} -> "
+            f"{self._preallocated_token_capacity}",
+            extra={"rank": self.rank},
+        )
+
+        for field_name in self._field_dtypes:
+            extra_dims = self._field_extra_dims[field_name]
+            old_memmap = self._memmap_files[field_name]
+            new_shape = (self._preallocated_token_capacity,) + extra_dims
+
+            new_path = self._memmap_dir / f"{field_name}_new.npy"
+            new_memmap = np.memmap(
+                str(new_path),
+                dtype=self._field_dtypes[field_name],
+                mode="w+",
+                shape=new_shape,
+            )
+
+            if self._total_tokens_written > 0:
+                new_memmap[: self._total_tokens_written] = old_memmap[: self._total_tokens_written]
+                new_memmap.flush()
+
+            del old_memmap
+            self._memmap_files[field_name] = None
+            old_path = self._memmap_dir / f"{field_name}.npy"
+            os.replace(str(new_path), str(old_path))
+            self._memmap_files[field_name] = np.memmap(
+                str(old_path),
+                dtype=self._field_dtypes[field_name],
+                mode="r+",
+                shape=new_shape,
+            )
+
+    def _expand_sample_capacity(self):
+        """Expand offsets array when sample count exceeds preallocated capacity."""
+        old_capacity = self._preallocated_sample_capacity
+        self._preallocated_sample_capacity = int(old_capacity * 1.5) + 10
+
+        logger.info(
+            f"Expanding sample capacity: {old_capacity} -> "
+            f"{self._preallocated_sample_capacity}",
+            extra={"rank": self.rank},
+        )
+
+        old_offsets = self._offsets
+        new_offsets_path = self._memmap_dir / "offsets_new.npy"
+        new_offsets = np.memmap(
+            str(new_offsets_path),
+            dtype=np.int64,
+            mode="w+",
+            shape=(self._preallocated_sample_capacity + 1,),
+        )
+        # Copy existing offsets (sample_count + 1 entries)
+        new_offsets[: self._sample_count + 1] = old_offsets[: self._sample_count + 1]
+        new_offsets.flush()
+
+        del old_offsets
+        self._offsets = None
+        old_offsets_path = self._memmap_dir / "offsets.npy"
+        os.replace(str(new_offsets_path), str(old_offsets_path))
+        self._offsets = np.memmap(
+            str(old_offsets_path),
+            dtype=np.int64,
+            mode="r+",
+            shape=(self._preallocated_sample_capacity + 1,),
+        )
+
+    def _write_sample_to_memmap(self, data_point: Dict[str, torch.Tensor]):
+        """Write a single sample to packed memmap files.
+
+        Data is appended at position self._total_tokens_written in the packed array.
+        The offsets array is updated to record the boundary.
+        """
+        # Get the seq_len of the current sample
+        sample_seq_len = 0
+        for _, tensor in data_point.items():
+            if isinstance(tensor, torch.Tensor) and tensor.ndim >= 2:
+                sample_seq_len = max(sample_seq_len, tensor.shape[1])
+
+        # Check if token capacity expansion is needed
+        required_tokens = self._total_tokens_written + sample_seq_len
+        if required_tokens > self._preallocated_token_capacity:
+            self._expand_token_capacity(required_tokens)
+
+        # Check if sample capacity expansion is needed
+        if self._sample_count >= self._preallocated_sample_capacity:
+            self._expand_sample_capacity()
+
+        write_offset = self._total_tokens_written
+
+        for field_name, tensor in data_point.items():
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            if field_name not in self._memmap_files:
+                continue
+
+            # tensor shape: [1, N, ...], remove batch dimension
+            arr = tensor.squeeze(0)  # [N, ...]
+            if tensor.dtype == torch.bfloat16:
+                arr = arr.float().half()  # bfloat16 -> float32 -> float16
+            arr_np = arr.contiguous().numpy()
+
+            seq_len = arr_np.shape[0]
+            # Write to packed position: [write_offset : write_offset + seq_len]
+            self._memmap_files[field_name][write_offset : write_offset + seq_len] = arr_np
+
+        # Update offsets and counters
+        self._total_tokens_written += sample_seq_len
+        self._sample_count += 1
+        self._offsets[self._sample_count] = self._total_tokens_written
+
+        # Flush every 100 samples to ensure data persistence
+        if self._sample_count % 100 == 0:
+            for mm in self._memmap_files.values():
+                if mm is not None:
+                    mm.flush()
+            self._offsets.flush()
+
+    def _finalize_memmap(self):
+        """Finalize packed memmap writing: truncate to actual size and save metadata."""
+        if not self._memmap_initialized or self._sample_count == 0:
+            return
+
+        total_tokens = self._total_tokens_written
+
+        # Flush all memmap files
+        for mm in self._memmap_files.values():
+            if mm is not None:
+                mm.flush()
+        self._offsets.flush()
+
+        # Truncate packed data files to actual token count
+        need_truncate_tokens = total_tokens < self._preallocated_token_capacity
+        need_truncate_samples = self._sample_count < self._preallocated_sample_capacity
+
+        if need_truncate_tokens:
+            logger.info(
+                f"Truncating packed memmap: tokens {self._preallocated_token_capacity} -> "
+                f"{total_tokens}, samples {self._preallocated_sample_capacity} -> "
+                f"{self._sample_count}",
+                extra={"rank": self.rank},
+            )
+
+            for field_name in self._field_dtypes:
+                extra_dims = self._field_extra_dims[field_name]
+                old_memmap = self._memmap_files[field_name]
+                final_shape = (total_tokens,) + extra_dims
+
+                final_path = self._memmap_dir / f"{field_name}_final.npy"
+                final_memmap = np.memmap(
+                    str(final_path),
+                    dtype=self._field_dtypes[field_name],
+                    mode="w+",
+                    shape=final_shape,
+                )
+                final_memmap[:] = old_memmap[:total_tokens]
+                final_memmap.flush()
+
+                del old_memmap, final_memmap
+                self._memmap_files[field_name] = None
+                old_path = self._memmap_dir / f"{field_name}.npy"
+                os.replace(str(final_path), str(old_path))
+
+        if need_truncate_samples:
+            # Truncate offsets to actual sample count + 1
+            old_offsets = self._offsets
+            final_offsets_path = self._memmap_dir / "offsets_final.npy"
+            final_offsets = np.memmap(
+                str(final_offsets_path),
+                dtype=np.int64,
+                mode="w+",
+                shape=(self._sample_count + 1,),
+            )
+            final_offsets[:] = old_offsets[: self._sample_count + 1]
+            final_offsets.flush()
+            del old_offsets, final_offsets
+            self._offsets = None
+            old_offsets_path = self._memmap_dir / "offsets.npy"
+            os.replace(str(final_offsets_path), str(old_offsets_path))
+
+        # Save metadata JSON
+        metadata = {
+            "format": "packed",  # Distinguish from the old rectangular format
+            "total_samples": self._sample_count,
+            "total_tokens": total_tokens,
+            "fields": {},
+        }
+        for field_name in self._field_dtypes:
+            extra_dims = self._field_extra_dims[field_name]
+            final_shape = (total_tokens,) + extra_dims
+            metadata["fields"][field_name] = {
+                "dtype": np.dtype(self._field_dtypes[field_name]).name,
+                "shape": list(final_shape),
+            }
+        metadata["fields"]["offsets"] = {
+            "dtype": "int64",
+            "shape": [self._sample_count + 1],
+        }
+
+        metadata_path = self._memmap_dir / "metadata.json"
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        logger.info(
+            f"Packed memmap finalized: {self._sample_count} samples, "
+            f"{total_tokens} total tokens, "
+            f"dir={self._memmap_dir}",
+            extra={"rank": self.rank},
+        )
 
     def _process_single_sample(self, idx: int, row: Dict[str, Any]) -> bool:
         """
@@ -279,13 +565,6 @@ class HiddenStateGenerator:
         Returns:
             True if processing succeeded, False otherwise
         """
-        output_file = self._get_output_path(idx)
-
-        # Skip if file already exists
-        if output_file.exists():
-            logger.debug(f"Skipping existing file: {output_file}", extra={"rank": self.rank})
-            return True
-
         try:
             # Generate aux and target hiddens
             device = decide_device_for_distributed()
@@ -380,8 +659,12 @@ class HiddenStateGenerator:
             batch_token_dict = dict(zip(unique_ids.tolist(), counts.tolist()))
             self.token_dict.update(batch_token_dict)
 
-            # Save to disk
-            torch.save(data_point, output_file)
+            # Initialize memmap on first write
+            if not self._memmap_initialized:
+                self._init_memmap(data_point, self._total_samples_estimate)
+
+            # Write directly to memmap
+            self._write_sample_to_memmap(data_point)
             return True
 
         except Exception as e:
@@ -401,6 +684,9 @@ class HiddenStateGenerator:
         successful = 0
         failed = 0
 
+        # Set estimated total sample count for memmap preallocation
+        self._total_samples_estimate = len(dataset)
+
         # Only show progress bar on rank 0
         iterator = (
             tqdm(
@@ -418,11 +704,18 @@ class HiddenStateGenerator:
             else:
                 failed += 1
 
+        # Finalize memmap writing: truncate to actual size and save metadata
+        self._finalize_memmap()
+
         logger.info(
             f"Processing complete. Success: {successful}, Failed: {failed}",
             extra={"rank": self.rank},
         )
-        logger.info(f"Results saved to {self.output_dir}", extra={"rank": self.rank})
+        logger.info(
+            f"Results saved to {self._memmap_dir} "
+            f"({self._sample_count} samples in memmap format)",
+            extra={"rank": self.rank},
+        )
 
         return successful, failed
 
