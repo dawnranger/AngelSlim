@@ -31,16 +31,26 @@ class OfflineEagle3Trainer(Eagle3Trainer):
     avoiding the need for online target model inference.
     """
 
-    def __init__(self, draft_model: nn.Module, target_head: nn.Module, length: int, **kwargs):
+    def __init__(
+        self,
+        draft_model: nn.Module,
+        target_head: nn.Module,
+        length: int,
+        enable_profiler: bool = False,
+        **kwargs
+    ):
         """
         Initialize the OnlineEagle3Trainer.
 
         Args:
             draft_model: Draft model for token prediction
             length: Number of speculative decoding steps
+            enable_profiler: Whether to enable PyTorch Profiler
             **kwargs: Additional arguments passed to parent Trainer
         """
-        super().__init__(draft_model=draft_model, length=length, **kwargs)
+        super().__init__(
+            draft_model=draft_model, length=length, enable_profiler=enable_profiler, **kwargs
+        )
         self.target_head = target_head
 
     def prepare_data_for_draft_model(
@@ -107,16 +117,26 @@ class OfflineVLMEagle3Trainer(Eagle3Trainer):
     avoiding the need for online target model inference.
     """
 
-    def __init__(self, draft_model: nn.Module, target_head: nn.Module, length: int, **kwargs):
+    def __init__(
+        self,
+        draft_model: nn.Module,
+        target_head: nn.Module,
+        length: int,
+        enable_profiler: bool = False,
+        **kwargs
+    ):
         """
         Initialize the OnlineEagle3Trainer.
 
         Args:
             draft_model: Draft model for token prediction
             length: Number of speculative decoding steps
+            enable_profiler: Whether to enable PyTorch Profiler
             **kwargs: Additional arguments passed to parent Trainer
         """
-        super().__init__(draft_model=draft_model, length=length, **kwargs)
+        super().__init__(
+            draft_model=draft_model, length=length, enable_profiler=enable_profiler, **kwargs
+        )
         self.target_head = target_head
 
     def prepare_data_for_draft_model(

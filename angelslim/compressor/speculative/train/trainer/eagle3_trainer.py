@@ -20,11 +20,35 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.utils.checkpoint
 from torch import nn
+from torch.profiler import (
+    ProfilerActivity,
+    profile,
+    record_function,
+    schedule,
+    tensorboard_trace_handler,
+)
 from transformers import Trainer
 
+from angelslim.utils import rank0_print
 from angelslim.utils.lazy_imports import deepspeed
 
 from ...utils import padding
+
+
+def _gpu_mem_stats(device=None):
+    """Return GPU memory stats in MB for diagnostics."""
+    if not torch.cuda.is_available():
+        return {}
+    if device is None:
+        device = torch.cuda.current_device()
+    allocated = torch.cuda.memory_allocated(device) / 1024 / 1024
+    reserved = torch.cuda.memory_reserved(device) / 1024 / 1024
+    max_allocated = torch.cuda.max_memory_allocated(device) / 1024 / 1024
+    return {
+        "allocated_MB": round(allocated, 1),
+        "reserved_MB": round(reserved, 1),
+        "max_allocated_MB": round(max_allocated, 1),
+    }
 
 
 class Eagle3Trainer(Trainer, ABC):
@@ -35,27 +59,162 @@ class Eagle3Trainer(Trainer, ABC):
     tokens based on hidden states from a target model.
     """
 
-    def __init__(self, draft_model: nn.Module, length: int, **kwargs):
+    def __init__(
+        self,
+        draft_model: nn.Module,
+        length: int,
+        enable_profiler: bool = False,
+        custom_train_sampler=None,
+        **kwargs,
+    ):
         """
         Initialize the OnlineEagle3Trainer.
 
         Args:
             draft_model: Draft model for token prediction
             length: Number of speculative decoding steps
+            enable_profiler: Whether to enable PyTorch Profiler for performance analysis
+            custom_train_sampler: Optional custom sampler for training DataLoader
+                (e.g. LengthBucketSampler for reducing padding waste)
             **kwargs: Additional arguments passed to parent Trainer
         """
         super().__init__(model=draft_model, **kwargs)
         self.length = length
+        self._custom_train_sampler = custom_train_sampler
         self._train_start_time = None
         self._pending_log: dict = (
             {}
         )  # cache acc/ploss log for merging with base Trainer's loss log
         self._pending_log_count: int = 0  # accumulated batch count for averaging the cached log
 
+        # Performance profiling counters
+        self._perf_step_count: int = 0
+        self._perf_data_prep_time: float = 0.0
+        self._perf_forward_time: float = 0.0
+        self._perf_total_step_time: float = 0.0
+        self._perf_last_step_end: float = 0.0
+        self._perf_dataloader_wait_time: float = 0.0
+        self._perf_log_interval: int = 50  # Log performance stats every N steps
+
+        # PyTorch Profiler
+        self._enable_profiler = enable_profiler
+        self._profiler: Optional[profile] = None
+        self._profiler_started = False
+
+    def _get_train_sampler(self):
+        """Override to use custom sampler (e.g. LengthBucketSampler) if provided."""
+        if self._custom_train_sampler is not None:
+            return self._custom_train_sampler
+        return super()._get_train_sampler()
+
+    def _setup_profiler(self):
+        """Setup PyTorch Profiler with schedule for performance analysis."""
+        if not self._enable_profiler:
+            return
+
+        profiler_output_dir = os.path.join(self.args.output_dir, "profiler")
+        os.makedirs(profiler_output_dir, exist_ok=True)
+
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+        # Schedule: wait 2 steps, then actively profile steps 3-5, no repeat.
+        # step() call index:  0(wait)  1(wait)  2(active)  3(active)  4(active)
+        # Corresponding training step:  1        2          3           4          5
+        # After step index 4 the profiler cycle is done and we stop it immediately.
+        profiler_schedule = schedule(
+            wait=19,  # Skip first 2 steps (warmup / JIT compilation)
+            warmup=0,  # No warmup – start recording right at step 3
+            active=3,  # Actively profile 3 steps (step 3, 4, 5)
+            repeat=1,  # Single cycle, no repeat
+        )
+
+        # Total profiler.step() calls needed = wait + warmup + active = 5
+        self._profiler_total_steps = 2 + 0 + 3  # 5
+        self._profiler_step_count = 0
+
+        activities = [ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(ProfilerActivity.CUDA)
+
+        self._profiler = profile(
+            activities=activities,
+            schedule=profiler_schedule,
+            on_trace_ready=tensorboard_trace_handler(
+                profiler_output_dir,
+                worker_name=f"rank{local_rank}",
+            ),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_flops=True,
+        )
+
+        rank0_print("[PROFILER] PyTorch Profiler enabled")
+        rank0_print(f"[PROFILER] Output dir: {profiler_output_dir}")
+        rank0_print("[PROFILER] Schedule: wait=2, warmup=0, active=3, repeat=1")
+        rank0_print("[PROFILER] Will profile training steps 3-5, then auto-stop")
+        rank0_print(f"[PROFILER] Activities: {[a.name for a in activities]}")
+        rank0_print(
+            "[PROFILER] Features: record_shapes=True, profile_memory=True, "
+            "with_stack=True, with_flops=True"
+        )
+        rank0_print(f"[PROFILER] View results with: tensorboard --logdir {profiler_output_dir}")
+
     def train(self, *args, **kwargs):
         """Override train method to record training start time for estimating remaining time."""
         self._train_start_time = time.time()
-        return super().train(*args, **kwargs)
+        self._perf_last_step_end = self._train_start_time
+
+        # Log initial GPU memory and training config summary
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        mem = _gpu_mem_stats()
+        rank0_print("[PERF] === Training Performance Profiling Enabled ===")
+        rank0_print(f"[PERF] Initial GPU memory: {mem}")
+        rank0_print(
+            "[PERF] Draft model parameters: "
+            f"{sum(p.numel() for p in self.model.parameters()):,} total, "
+            f"{sum(p.numel() for p in self.model.parameters() if p.requires_grad):,} trainable"
+        )
+        rank0_print(f"[PERF] Training length (spec steps): {self.length}")
+        rank0_print(f"[PERF] Gradient checkpointing (args): {self.args.gradient_checkpointing}")
+        rank0_print(f"[PERF] Per-device batch size: {self.args.per_device_train_batch_size}")
+        rank0_print(f"[PERF] Gradient accumulation steps: {self.args.gradient_accumulation_steps}")
+        rank0_print(f"[PERF] World size: {self.args.world_size}")
+        global_bach_size = (
+            self.args.per_device_train_batch_size
+            * self.args.gradient_accumulation_steps
+            * self.args.world_size
+        )
+        rank0_print(f"[PERF] Effective batch size: {global_bach_size}")
+        rank0_print(f"[PERF] DeepSpeed enabled: {self.is_deepspeed_enabled}")
+        rank0_print(f"[PERF] bf16: {self.args.bf16}, fp16: {self.args.fp16}")
+        rank0_print(f"[PERF] Dataloader num_workers: {self.args.dataloader_num_workers}")
+        rank0_print(f"[PERF] Dataloader prefetch_factor: {self.args.dataloader_prefetch_factor}")
+
+        # Setup and start PyTorch Profiler
+        self._setup_profiler()
+        if self._profiler is not None:
+            self._profiler.__enter__()
+            self._profiler_started = True
+
+        try:
+            result = super().train(*args, **kwargs)
+        finally:
+            # Safety net: stop profiler if it wasn't already stopped during training
+            self._stop_profiler()
+
+        return result
+
+    def _stop_profiler(self):
+        """Stop the profiler if it is still running."""
+        if self._profiler is not None and self._profiler_started:
+            self._profiler.__exit__(None, None, None)
+            self._profiler_started = False
+            rank0_print(
+                f"[PROFILER] Profiler stopped. Trace files saved to: "
+                f"{os.path.join(self.args.output_dir, 'profiler')}"
+            )
 
     def log(self, logs: dict, start_time: Optional[float] = None) -> None:
         """
@@ -133,28 +292,92 @@ class Eagle3Trainer(Trainer, ABC):
         Returns:
             Tuple of (prediction_losses, value_losses, accuracies) for each step
         """
-        data_for_draft_model = self.prepare_data_for_draft_model(inputs)
+        step_start = time.time()
 
-        attention_mask = data_for_draft_model["attention_mask"]  # Batch x Seq
-        position_ids = data_for_draft_model["position_ids"]
-        input_ids = data_for_draft_model["input_ids"]  # Batch x Seq
-        target_logits = data_for_draft_model["target_logits"]  # Batch x Seq x Vocab
-        loss_mask = data_for_draft_model["loss_mask"]  # Batch x Seq x 1
-        hidden_states = data_for_draft_model["hidden_states"]  # Batch x Seq x Hidden
+        # Measure time waiting for data (time between last step end and this step start)
+        if self._perf_last_step_end > 0:
+            dataloader_wait = step_start - self._perf_last_step_end
+            self._perf_dataloader_wait_time += dataloader_wait
 
-        hidden_states = self.down_project_hidden_states(hidden_states)
-        attention_mask, position_ids = self.prepare_attention_mask_and_position_ids(
-            hidden_states, attention_mask, position_ids
-        )
-        loss = self.draft_model_training_time_test(
-            input_ids,
-            hidden_states,
-            attention_mask,
-            position_ids,
-            target_logits,
-            loss_mask,
-            log_prefix="train",
-        )
+        # Measure data preparation time
+        t0 = time.time()
+        with record_function("data_preparation"):
+            data_for_draft_model = self.prepare_data_for_draft_model(inputs)
+
+            attention_mask = data_for_draft_model["attention_mask"]  # Batch x Seq
+            position_ids = data_for_draft_model["position_ids"]
+            input_ids = data_for_draft_model["input_ids"]  # Batch x Seq
+            target_logits = data_for_draft_model["target_logits"]  # Batch x Seq x Vocab
+            loss_mask = data_for_draft_model["loss_mask"]  # Batch x Seq x 1
+            hidden_states = data_for_draft_model["hidden_states"]  # Batch x Seq x Hidden
+
+            hidden_states = self.down_project_hidden_states(hidden_states)
+            attention_mask, position_ids = self.prepare_attention_mask_and_position_ids(
+                hidden_states, attention_mask, position_ids
+            )
+        data_prep_time = time.time() - t0
+        self._perf_data_prep_time += data_prep_time
+
+        # Measure forward + loss computation time
+        t1 = time.time()
+        with record_function("draft_model_forward_and_loss"):
+            loss = self.draft_model_training_time_test(
+                input_ids,
+                hidden_states,
+                attention_mask,
+                position_ids,
+                target_logits,
+                loss_mask,
+                log_prefix="train",
+            )
+        forward_time = time.time() - t1
+        self._perf_forward_time += forward_time
+
+        total_step_time = time.time() - step_start
+        self._perf_total_step_time += total_step_time
+        self._perf_step_count += 1
+        self._perf_last_step_end = time.time()
+
+        # Step the profiler and auto-stop after the scheduled cycle completes
+        if self._profiler is not None and self._profiler_started:
+            self._profiler.step()
+            self._profiler_step_count += 1
+            if self._profiler_step_count >= self._profiler_total_steps:
+                self._stop_profiler()
+                rank0_print(
+                    f"[PROFILER] Profiling complete after step {self._profiler_step_count}. "
+                    f"Training continues without profiler overhead."
+                )
+
+        # Log performance stats periodically
+        if self._perf_step_count % self._perf_log_interval == 0:
+            n = self._perf_step_count
+            avg_total = self._perf_total_step_time / n * 1000
+            avg_data_prep = self._perf_data_prep_time / n * 1000
+            avg_forward = self._perf_forward_time / n * 1000
+            avg_dl_wait = self._perf_dataloader_wait_time / n * 1000
+            mem = _gpu_mem_stats()
+
+            # Log input shape for understanding batch characteristics
+            batch_size = input_ids.shape[0]
+            seq_len = input_ids.shape[1]
+
+            rank0_print(
+                f"[PERF] Step {n} | "
+                f"avg_step={avg_total:.1f}ms | "
+                f"avg_data_prep={avg_data_prep:.1f}ms | "
+                f"avg_forward={avg_forward:.1f}ms | "
+                f"avg_dl_wait={avg_dl_wait:.1f}ms | "
+                f"batch={batch_size}x{seq_len} | "
+                f"GPU_mem={mem}"
+            )
+
+            # Reset counters to get recent averages
+            self._perf_step_count = 0
+            self._perf_data_prep_time = 0.0
+            self._perf_forward_time = 0.0
+            self._perf_total_step_time = 0.0
+            self._perf_dataloader_wait_time = 0.0
 
         return loss
 
@@ -242,19 +465,20 @@ class Eagle3Trainer(Trainer, ABC):
         _tl = target_logits
         _lm = loss_mask
         _ids = input_ids
-        for idx in range(self.length):
-            with torch.no_grad():
-                target_max_token = _tl.argmax(-1)
-                target_mask = t2d[target_max_token][..., None].int()
-                position_mask = target_mask * _lm
-                target_head = _tl[..., t2d].float()
-                target_p = nn.Softmax(dim=2)(target_head).detach()
-                target_p_argmax = target_p.argmax(-1)
-            precomputed_targets.append((target_p, position_mask, target_p_argmax, _lm, _ids))
-            if idx < self.length - 1:
-                _tl = padding(_tl, left=False)
-                _lm = padding(_lm, left=False)
-                _ids = padding(_ids, left=False)
+        with record_function("precompute_targets"):
+            for idx in range(self.length):
+                with torch.no_grad():
+                    target_max_token = _tl.argmax(-1)
+                    target_mask = t2d[target_max_token][..., None].int()
+                    position_mask = target_mask * _lm
+                    target_head = _tl[..., t2d].float()
+                    target_p = nn.Softmax(dim=2)(target_head).detach()
+                    target_p_argmax = target_p.argmax(-1)
+                precomputed_targets.append((target_p, position_mask, target_p_argmax, _lm, _ids))
+                if idx < self.length - 1:
+                    _tl = padding(_tl, left=False)
+                    _lm = padding(_lm, left=False)
+                    _ids = padding(_ids, left=False)
         del _tl, _lm, _ids, target_logits
 
         # Step 7: Iterative speculative decoding training loop
@@ -264,45 +488,49 @@ class Eagle3Trainer(Trainer, ABC):
             )
 
             # Step 7.1: Get input embeddings with gradient tracking
-            if idx == 0:
-                cur_input_ids_for_embed = input_ids
-            else:
-                cur_input_ids_for_embed = cur_input_ids
-            inputs_embeds = self.draft_model.embed_input_ids(cur_input_ids_for_embed)
-            if not inputs_embeds.requires_grad:
-                inputs_embeds.requires_grad = True
+            with record_function(f"spec_step_{idx}/embed"):
+                if idx == 0:
+                    cur_input_ids_for_embed = input_ids
+                else:
+                    cur_input_ids_for_embed = cur_input_ids
+                inputs_embeds = self.draft_model.embed_input_ids(cur_input_ids_for_embed)
+                if not inputs_embeds.requires_grad:
+                    inputs_embeds.requires_grad = True
 
             # Step 7.2: Encode through draft model layers
-            if (
-                getattr(self.draft_model, "gradient_checkpointing", False)
-                and self.draft_model.training
-            ):
-                hidden_states, cache_hidden = torch.utils.checkpoint.checkpoint(
-                    self.draft_model.encode_layers,
-                    inputs_embeds,
-                    hidden_states,
-                    cache_hidden,
-                    attention_mask,
-                    position_ids,
-                    True,
-                    use_reentrant=False,
-                )
-            else:
-                hidden_states, cache_hidden = self.draft_model.encode_layers(
-                    inputs_embeds=inputs_embeds,
-                    hidden_states=hidden_states,
-                    cache_hidden=cache_hidden,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    use_cache=True,
-                )
+            with record_function(f"spec_step_{idx}/encode_layers"):
+                if (
+                    getattr(self.draft_model, "gradient_checkpointing", False)
+                    and self.draft_model.training
+                ):
+                    hidden_states, cache_hidden = torch.utils.checkpoint.checkpoint(
+                        self.draft_model.encode_layers,
+                        inputs_embeds,
+                        hidden_states,
+                        cache_hidden,
+                        attention_mask,
+                        position_ids,
+                        True,
+                        use_reentrant=False,
+                    )
+                else:
+                    hidden_states, cache_hidden = self.draft_model.encode_layers(
+                        inputs_embeds=inputs_embeds,
+                        hidden_states=hidden_states,
+                        cache_hidden=cache_hidden,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        use_cache=True,
+                    )
 
             # Step 7.3: Compute logits from hidden states
-            logits = self.draft_model.compute_logits(hidden_states)
+            with record_function(f"spec_step_{idx}/compute_logits"):
+                logits = self.draft_model.compute_logits(hidden_states)
 
             # Step 7.5: Compute loss (target_p and position_mask are pre-computed)
-            out_logp = nn.LogSoftmax(dim=2)(logits)
-            loss = -torch.sum(position_mask * target_p * out_logp, dim=2).mean()
+            with record_function(f"spec_step_{idx}/loss_computation"):
+                out_logp = nn.LogSoftmax(dim=2)(logits)
+                loss = -torch.sum(position_mask * target_p * out_logp, dim=2).mean()
 
             # Step 7.6: Compute accuracy
             with torch.no_grad():

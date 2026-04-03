@@ -28,6 +28,10 @@ from angelslim.compressor.speculative import (
     get_supported_chat_template_type_strings,
     infer_model_params,
 )
+from angelslim.compressor.speculative.train.data.dataset_builder.offline_dataset_builder import (
+    LengthBucketSampler,
+    MemmapOfflineEagle3Dataset,
+)
 from angelslim.utils import rank0_print
 
 
@@ -274,6 +278,17 @@ def parse_args():
             "Supported platforms: 'tensorboard', 'wandb', 'mlflow', 'all', 'none'"
         ),
     )
+    training_group.add_argument(
+        "--enable_profiler",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable PyTorch Profiler for performance analysis. "
+            "Generates trace files in output_dir/profiler/ that can be viewed "
+            "with TensorBoard (tensorboard --logdir output_dir/profiler/) "
+            "or Chrome Trace Viewer (chrome://tracing)."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -365,6 +380,31 @@ def train():
         f"{len(offline_eval_dataset) if offline_eval_dataset else 0}"
     )
 
+    # Log dataset and sample info for performance analysis
+    if len(offline_train_dataset) > 0:
+        import time as _time
+
+        _t0 = _time.time()
+        rank0_print("[PERF] Loading first sample from dataset (this triggers shard IO)...")
+        sample = offline_train_dataset[0]
+        _t1 = _time.time()
+        rank0_print(f"[PERF] First sample loaded in {_t1 - _t0:.2f}s")
+        rank0_print("[PERF] Sample data shapes:")
+        for k, v in sample.items():
+            if hasattr(v, "shape"):
+                rank0_print(f"[PERF]   {k}: shape={v.shape}, dtype={v.dtype}")
+        # Estimate single sample size in MB
+        sample_size_mb = (
+            sum(v.numel() * v.element_size() for v in sample.values() if hasattr(v, "numel"))
+            / 1024
+            / 1024
+        )
+        rank0_print(f"[PERF] Estimated single sample size: {sample_size_mb:.2f} MB")
+        rank0_print(
+            "[PERF] Total dataset size estimate: "
+            f"{sample_size_mb * len(offline_train_dataset):.1f} MB"
+        )
+
     # Build vocabulary mapping for draft model from pre-computed vocab mapping
     rank0_print("Loading vocabulary mapping for draft model...")
     vocab_mapping_path = os.path.join(args.train_hidden_path, "vocab_mapping.pt")
@@ -421,9 +461,10 @@ def train():
     }
 
     # prefetch data
+    # Too many workers may cause CPU memory explosion (OOM).
     dataloader_args = {
-        "dataloader_num_workers": 4,
-        "dataloader_prefetch_factor": 2,
+        "dataloader_num_workers": 8,
+        "dataloader_prefetch_factor": 8,
     }
 
     training_args = transformers.TrainingArguments(
@@ -438,6 +479,18 @@ def train():
         remove_unused_columns=False,
     )
 
+    # Create LengthBucketSampler for memmap datasets to reduce padding waste
+    custom_train_sampler = None
+    if isinstance(offline_train_dataset, MemmapOfflineEagle3Dataset):
+        custom_train_sampler = LengthBucketSampler(
+            dataset=offline_train_dataset,
+            batch_size=args.per_device_train_batch_size,
+            seed=args.shuffle_seed,
+        )
+        rank0_print("[PERF] LengthBucketSampler enabled for reducing padding waste")
+    else:
+        rank0_print("[PERF] LengthBucketSampler not applicable (non-memmap dataset)")
+
     # Initialize trainer with offline datasets
     rank0_print("Initializing trainer...")
     trainer = Eagle3TrainerFactory.create(
@@ -446,11 +499,50 @@ def train():
         draft_model=draft_model,
         target_head=target_head,
         length=args.training_time_test_length,
+        enable_profiler=args.enable_profiler,
+        custom_train_sampler=custom_train_sampler,
         args=training_args,
         train_dataset=offline_train_dataset,
         eval_dataset=offline_eval_dataset,
         data_collator=data_collator,
     )
+
+    # Log GPU memory before training
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        allocated = torch.cuda.memory_allocated() / 1024 / 1024
+        reserved = torch.cuda.memory_reserved() / 1024 / 1024
+        rank0_print(
+            f"[PERF] GPU memory before training: allocated="
+            f"{allocated:.1f}MB, reserved={reserved:.1f}MB"
+        )
+
+    # Log estimated training throughput
+    total_samples = len(offline_train_dataset)
+    effective_batch = (
+        args.per_device_train_batch_size
+        * args.gradient_accumulation_steps
+        * training_args.world_size
+    )
+    steps_per_epoch = max(total_samples // effective_batch, 1)
+    total_steps = steps_per_epoch * args.num_train_epochs
+    rank0_print("[PERF] === Training Throughput Estimate ===")
+    rank0_print(f"[PERF] Total samples: {total_samples}")
+    rank0_print(
+        f"[PERF] Effective batch size: {effective_batch} "
+        f"(per_device={args.per_device_train_batch_size} x "
+        f"grad_accum={args.gradient_accumulation_steps} x "
+        f"world_size={training_args.world_size})"
+    )
+    rank0_print(f"[PERF] Steps per epoch: {steps_per_epoch}")
+    rank0_print(f"[PERF] Total steps: {total_steps}")
+    rank0_print(f"[PERF] Num epochs: {args.num_train_epochs}")
+    rank0_print(f"[PERF] Max model len: {args.max_model_len}")
+    rank0_print(f"[PERF] Save steps: {args.save_steps}")
+    rank0_print(f"[PERF] Gradient checkpointing: {args.gradient_checkpointing}")
+    rank0_print(f"[PERF] DeepSpeed config: {args.deepspeed}")
 
     # Start training
     if list(Path(training_args.output_dir).glob("checkpoint-*")):
@@ -459,6 +551,12 @@ def train():
     else:
         rank0_print("Starting training...")
         trainer.train()
+
+    # Log final GPU memory stats
+    if torch.cuda.is_available():
+        peak_allocated = torch.cuda.max_memory_allocated() / 1024 / 1024
+        rank0_print(f"[PERF] Peak GPU memory allocated during training: {peak_allocated:.1f}MB")
+
     rank0_print("Training completed!")
 
     # Save final model to output_dir

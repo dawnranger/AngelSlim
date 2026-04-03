@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from angelslim.utils import rank0_print
 
@@ -301,6 +301,34 @@ class MemmapOfflineEagle3Dataset(Dataset):
     def __len__(self) -> int:
         return self.total_samples
 
+    def get_sample_length(self, idx: int) -> int:
+        """Get the sequence length of a sample without loading data.
+
+        This is an O(1) operation that only reads from the offsets array,
+        useful for length-based bucketing samplers to reduce padding waste.
+
+        Args:
+            idx: Global sample index.
+
+        Returns:
+            Sequence length (number of tokens) of the sample.
+        """
+        dir_idx, local_idx = self.global_index[idx]
+        offsets = self._dir_offsets[dir_idx]
+        return int(offsets[local_idx + 1]) - int(offsets[local_idx])
+
+    def get_all_sample_lengths(self) -> np.ndarray:
+        """Get sequence lengths for all samples efficiently.
+
+        Returns:
+            numpy array of shape (total_samples,) with each sample's length.
+        """
+        lengths = np.empty(self.total_samples, dtype=np.int64)
+        for i, (dir_idx, local_idx) in enumerate(self.global_index):
+            offsets = self._dir_offsets[dir_idx]
+            lengths[i] = int(offsets[local_idx + 1]) - int(offsets[local_idx])
+        return lengths
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         dir_idx, local_idx = self.global_index[idx]
         field_memmaps = self._dir_memmaps[dir_idx]
@@ -314,8 +342,11 @@ class MemmapOfflineEagle3Dataset(Dataset):
             # Read slice [start:end, ...] for this sample
             arr = mm[start:end]  # [seq_len, ...] or [seq_len]
 
-            # np.memmap returns a view, copy is needed to convert to tensor
-            tensor = torch.from_numpy(arr.copy())
+            # np.memmap returns a view; np.ascontiguousarray materializes
+            # the data into a contiguous buffer more efficiently than .copy(),
+            # and torch.from_numpy can then share that buffer without an
+            # additional copy.
+            tensor = torch.from_numpy(np.ascontiguousarray(arr))
 
             # Add batch dimension [1, seq_len, ...]
             tensor = tensor.unsqueeze(0)
@@ -396,6 +427,89 @@ class OfflineVLMEagle3Dataset(OfflineEagle3Dataset):
         attention_mask = torch.ones_like(data["input_ids"])
         data["attention_mask"] = attention_mask  # B, N
         return data
+
+
+class LengthBucketSampler(Sampler):
+    """Sampler that groups samples by sequence length to minimize padding waste.
+
+    Sorts all samples by length, divides them into buckets of ``bucket_size``,
+    shuffles the buckets (and samples within each bucket) every epoch, then
+    yields indices one by one.  Because samples in the same bucket have
+    similar lengths, the DataCollator's padding overhead is greatly reduced.
+
+    Works with both single-GPU and distributed (DDP / DeepSpeed) training:
+    - Single-GPU: use directly as ``sampler`` in DataLoader.
+    - Distributed: wrap with ``DistributedSampler`` or pass to
+      HuggingFace Trainer which handles distribution automatically.
+
+    Args:
+        dataset: A ``MemmapOfflineEagle3Dataset`` (must expose
+            ``get_all_sample_lengths()``).
+        batch_size: Per-device batch size.  Used to decide the default
+            ``bucket_size`` when it is not given explicitly.
+        bucket_size: Number of samples per bucket.  Larger values give
+            better length homogeneity but less randomness.  Defaults to
+            ``batch_size * 50``.
+        seed: Random seed for reproducibility.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        batch_size: int = 1,
+        bucket_size: Optional[int] = None,
+        seed: int = 42,
+    ):
+        super().__init__(dataset)
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.bucket_size = bucket_size or max(batch_size * 50, 100)
+        self.seed = seed
+        self.epoch = 0
+
+        # Pre-compute lengths (O(N) but only reads offsets, no data IO)
+        if hasattr(dataset, "get_all_sample_lengths"):
+            self._lengths = dataset.get_all_sample_lengths()
+        else:
+            # Fallback for non-memmap datasets
+            self._lengths = np.arange(len(dataset))
+
+        # Sort indices by length once
+        self._sorted_indices = np.argsort(self._lengths)
+
+        rank0_print(
+            f"[LengthBucketSampler] {len(dataset)} samples, "
+            f"bucket_size={self.bucket_size}, "
+            f"length range=[{self._lengths.min()}, {self._lengths.max()}], "
+            f"median={int(np.median(self._lengths))}"
+        )
+
+    def __iter__(self):
+        rng = np.random.RandomState(self.seed + self.epoch)
+
+        # Split sorted indices into buckets
+        indices = self._sorted_indices.copy()
+        buckets = [
+            indices[i : i + self.bucket_size] for i in range(0, len(indices), self.bucket_size)
+        ]
+
+        # Shuffle bucket order
+        rng.shuffle(buckets)
+
+        # Shuffle within each bucket
+        for bucket in buckets:
+            rng.shuffle(bucket)
+
+        # Yield all indices
+        for bucket in buckets:
+            yield from bucket.tolist()
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def set_epoch(self, epoch: int):
+        """Set the epoch for shuffling (called by Trainer / DistributedSampler)."""
+        self.epoch = epoch
 
 
 @DatasetBuilderFactory.register("offline", "LLM")
