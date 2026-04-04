@@ -101,11 +101,11 @@ class Eagle3Trainer(Trainer, ABC):
         self._profiler: Optional[profile] = None
         self._profiler_started = False
 
-    def _get_train_sampler(self):
+    def _get_train_sampler(self, dataset=None):
         """Override to use custom sampler (e.g. LengthBucketSampler) if provided."""
         if self._custom_train_sampler is not None:
             return self._custom_train_sampler
-        return super()._get_train_sampler()
+        return super()._get_train_sampler(dataset)
 
     def _setup_profiler(self):
         """Setup PyTorch Profiler with schedule for performance analysis."""
