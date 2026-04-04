@@ -82,6 +82,8 @@ class HiddenStateGenerator:
         rank: int = 0,
         draft_vocab_size: int = None,
         target_vocab_size: int = None,
+        storage_precision: str = "bfloat16",
+        enable_int8_quantization: bool = False,
     ):
         """
         Initialize the hidden state generator.
@@ -92,12 +94,20 @@ class HiddenStateGenerator:
             rank: Process rank for distributed training
             draft_vocab_size: Size of draft model vocabulary (required for vocab mapping)
             target_vocab_size: Size of target model vocabulary (required for vocab mapping)
+            storage_precision: Storage precision for hidden states (bfloat16, float16, float32)
+            enable_int8_quantization: Whether to enable per-token absmax int8 quantization
+                for hidden_states and target_hiddens. Reduces storage by ~50%.
         """
         self.target_model = target_model
         self.output_dir = Path(output_dir)
         self.rank = rank
         self.draft_vocab_size = draft_vocab_size
         self.target_vocab_size = target_vocab_size
+
+        # Storage optimization config
+        self.storage_precision = storage_precision
+        self.enable_int8_quantization = enable_int8_quantization
+
         _max_pixels = os.environ.get("MAX_PIXELS")
         _min_pixels = os.environ.get("MIN_PIXELS", "1024")
         self.max_pixels = int(_max_pixels) if _max_pixels is not None else None
@@ -121,6 +131,89 @@ class HiddenStateGenerator:
 
         # Resolve image_pad token id for vLLM loss_mask rebuilding
         self._image_pad_token_id = None
+
+    @staticmethod
+    def _quantize_per_token_absmax_int8(tensor: torch.Tensor):
+        """Per-token absmax int8 quantization.
+
+        For a tensor of shape [B, N, D], compute per-token (per row in the
+        last two dims) scale = max(|x|) / 127, then quantize to int8.
+
+        Args:
+            tensor: Float tensor of shape [B, N, D]
+
+        Returns:
+            Tuple of (quantized_int8 [B, N, D], scales [B, N, 1])
+        """
+        # tensor: [B, N, D]
+        absmax = tensor.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)  # [B, N, 1]
+        scale = absmax / 127.0  # [B, N, 1]
+        quantized = (tensor / scale).round().clamp(-127, 127).to(torch.int8)  # [B, N, D]
+        return quantized, scale
+
+    @staticmethod
+    def _dequantize_per_token_absmax_int8(
+        quantized: torch.Tensor, scale: torch.Tensor, target_dtype: torch.dtype = torch.bfloat16
+    ):
+        """Dequantize per-token absmax int8 back to float.
+
+        Args:
+            quantized: int8 tensor of shape [B, N, D]
+            scale: float tensor of shape [B, N, 1]
+            target_dtype: Target float dtype
+
+        Returns:
+            Dequantized float tensor of shape [B, N, D]
+        """
+        return quantized.to(target_dtype) * scale.to(target_dtype)
+
+    def _convert_precision(self, data_point: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Convert data precision for storage."""
+        dtype_map = {
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "float32": torch.float32,
+        }
+        target_dtype = dtype_map.get(self.storage_precision, torch.bfloat16)
+
+        converted_data_point = {}
+        for key, tensor in data_point.items():
+            if isinstance(tensor, torch.Tensor) and tensor.is_floating_point():
+                if tensor.dtype != target_dtype:
+                    converted_data_point[key] = tensor.to(target_dtype)
+                else:
+                    converted_data_point[key] = tensor
+            else:
+                converted_data_point[key] = tensor
+
+        return converted_data_point
+
+    def _apply_int8_quantization(
+        self, data_point: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Apply per-token absmax int8 quantization to hidden_states and target_hiddens.
+
+        Replaces the original float tensors with int8 data + float32 scales:
+          hidden_states      -> hidden_states_int8  (int8)  + hidden_states_scales  (float32)
+          target_hiddens     -> target_hiddens_int8 (int8)  + target_hiddens_scales (float32)
+
+        This reduces storage by ~50% for these large tensors.
+        """
+        if not self.enable_int8_quantization:
+            return data_point
+
+        new_data_point = {}
+        for key, tensor in data_point.items():
+            if key in ("hidden_states", "target_hiddens") and isinstance(tensor, torch.Tensor):
+                # Quantize: tensor shape [B, N, D]
+                q_int8, scales = self._quantize_per_token_absmax_int8(tensor.float())
+                new_data_point[f"{key}_int8"] = q_int8  # [B, N, D] int8
+                new_data_point[f"{key}_scales"] = scales  # [B, N, 1] float32
+                # Do NOT keep the original float tensor
+            else:
+                new_data_point[key] = tensor
+
+        return new_data_point
 
     def _resolve_image_pad_token_id(self):
         """Lazily resolve the image_pad token id from the target model's tokenizer."""
@@ -287,7 +380,9 @@ class HiddenStateGenerator:
             extra_dims = per_sample_shape[1:]  # () or (D,) or (3*D,)
 
             # Determine numpy dtype
-            if tensor.dtype == torch.bfloat16:
+            if tensor.dtype == torch.int8:
+                np_dtype = np.int8
+            elif tensor.dtype == torch.bfloat16:
                 np_dtype = np.float16
             elif tensor.dtype == torch.float16:
                 np_dtype = np.float16
@@ -412,12 +507,23 @@ class HiddenStateGenerator:
         )
 
     def _write_sample_to_memmap(self, data_point: Dict[str, torch.Tensor]):
-        """Write a single sample to packed memmap files.
+        """Write a single sample to packed memmap files with storage optimizations.
 
         Data is appended at position self._total_tokens_written in the packed array.
         The offsets array is updated to record the boundary.
         """
-        # Get the seq_len of the current sample
+        # Apply storage optimizations:
+        # 1. Per-token absmax int8 quantization for hidden_states/target_hiddens
+        data_point = self._apply_int8_quantization(data_point)
+
+        # 2. Convert remaining float tensors to target precision
+        data_point = self._convert_precision(data_point)
+
+        # Initialize memmap on first write
+        if not self._memmap_initialized:
+            self._init_memmap(data_point, self._total_samples_estimate)
+
+        # Get seq_len after optimization
         sample_seq_len = 0
         for _, tensor in data_point.items():
             if isinstance(tensor, torch.Tensor) and tensor.ndim >= 2:
@@ -444,6 +550,8 @@ class HiddenStateGenerator:
             arr = tensor.squeeze(0)  # [N, ...]
             if tensor.dtype == torch.bfloat16:
                 arr = arr.float().half()  # bfloat16 -> float32 -> float16
+            elif tensor.dtype == torch.int8:
+                pass  # int8 can be directly converted to numpy
             arr_np = arr.contiguous().numpy()
 
             seq_len = arr_np.shape[0]
@@ -524,11 +632,15 @@ class HiddenStateGenerator:
             old_offsets_path = self._memmap_dir / "offsets.npy"
             os.replace(str(final_offsets_path), str(old_offsets_path))
 
-        # Save metadata JSON
+        # Save metadata JSON with storage optimization info
         metadata = {
             "format": "packed",  # Distinguish from the old rectangular format
             "total_samples": self._sample_count,
             "total_tokens": total_tokens,
+            "storage_optimization": {
+                "precision": self.storage_precision,
+                "int8_quantization": self.enable_int8_quantization,
+            },
             "fields": {},
         }
         for field_name in self._field_dtypes:
@@ -658,10 +770,6 @@ class HiddenStateGenerator:
             unique_ids, counts = masked_ids.unique(return_counts=True)
             batch_token_dict = dict(zip(unique_ids.tolist(), counts.tolist()))
             self.token_dict.update(batch_token_dict)
-
-            # Initialize memmap on first write
-            if not self._memmap_initialized:
-                self._init_memmap(data_point, self._total_samples_estimate)
 
             # Write directly to memmap
             self._write_sample_to_memmap(data_point)
@@ -882,6 +990,23 @@ def parse_arguments() -> argparse.Namespace:
         help="Path to draft model config file, used to read draft_vocab_size and vocab_size "
         "for computing vocab mapping",
     )
+
+    # Storage optimization arguments
+    parser.add_argument(
+        "--storage_precision",
+        type=str,
+        default="bfloat16",
+        choices=["bfloat16", "float16", "float32"],
+        help="Storage precision for hidden states. bfloat16/float16 reduce storage by 50%%",
+    )
+    parser.add_argument(
+        "--enable_int8_quantization",
+        action="store_true",
+        default=False,
+        help="Enable per-token absmax int8 quantization for hidden_states and target_hiddens. "
+        "Reduces storage by ~50%% for these tensors with minimal quality loss.",
+    )
+
     return parser.parse_args()
 
 
@@ -1074,12 +1199,22 @@ def main():
         output_dir = f"{args.outdir}/rank_{rank}"
         logger.info(f"writing hidden states to {output_dir}", extra={"rank": rank})
 
+        # Log storage optimization settings
+        logger.info(
+            f"[Storage Optimization Settings] "
+            f"Precision: {args.storage_precision}, "
+            f"Int8 Quantization: {args.enable_int8_quantization}",
+            extra={"rank": rank},
+        )
+
         generator = HiddenStateGenerator(
             target_model,
             output_dir,
             rank=rank,
             draft_vocab_size=draft_vocab_size,
             target_vocab_size=target_vocab_size,
+            storage_precision=args.storage_precision,
+            enable_int8_quantization=args.enable_int8_quantization,
         )
         successful, failed = generator.generate(dataset_slice)
 

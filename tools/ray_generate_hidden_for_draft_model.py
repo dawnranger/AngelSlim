@@ -190,6 +190,22 @@ def parse_arguments() -> argparse.Namespace:
         help='vLLM limit_mm_per_prompt, JSON format, e.g. \'{"image": 10, "video": 10}\'',
     )
 
+    # Storage optimization arguments
+    parser.add_argument(
+        "--storage_precision",
+        type=str,
+        default="bfloat16",
+        choices=["bfloat16", "float16", "float32"],
+        help="Storage precision for hidden states. bfloat16/float16 reduce storage by 50%%",
+    )
+    parser.add_argument(
+        "--enable_int8_quantization",
+        action="store_true",
+        default=False,
+        help="Enable per-token absmax int8 quantization for hidden_states and target_hiddens. "
+        "Reduces storage by ~50%% for these tensors with minimal quality loss.",
+    )
+
     return parser.parse_args()
 
 
@@ -271,6 +287,13 @@ def main():
                 f"Invalid JSON for --limit_mm_per_prompt: {args.limit_mm_per_prompt}. "
                 f"Error: {e}"
             )
+
+    # Log storage optimization settings
+    logger.info(
+        f"[Storage Optimization Settings] "
+        f"Precision: {args.storage_precision}, "
+        f"Int8 Quantization: {args.enable_int8_quantization}"
+    )
 
     # Calculate number of workers
     total_gpus = args.total_gpus
@@ -391,6 +414,8 @@ def main():
             draft_vocab_size,
             target_vocab_size,
             limit_mm_per_prompt=None,
+            storage_precision="bfloat16",
+            enable_int8_quantization=False,
         ):
             self.worker_id = worker_id
             self.model_path = model_path
@@ -398,6 +423,10 @@ def main():
             self.output_dir = output_dir
             self.draft_vocab_size = draft_vocab_size
             self.target_vocab_size = target_vocab_size
+
+            # Storage optimization config
+            self.storage_precision = storage_precision
+            self.enable_int8_quantization = enable_int8_quantization
 
             # Inside Ray actor:
             #   - No RANK/WORLD_SIZE or other torchrun environment variables
@@ -479,6 +508,8 @@ def main():
                 rank=self.worker_id,
                 draft_vocab_size=self.draft_vocab_size,
                 target_vocab_size=self.target_vocab_size,
+                storage_precision=self.storage_precision,
+                enable_int8_quantization=self.enable_int8_quantization,
             )
             successful, failed = generator.generate(dataset_slice)
 
@@ -516,6 +547,8 @@ def main():
             draft_vocab_size=draft_vocab_size,
             target_vocab_size=target_vocab_size,
             limit_mm_per_prompt=limit_mm_per_prompt,
+            storage_precision=args.storage_precision,
+            enable_int8_quantization=args.enable_int8_quantization,
         )
         workers.append(worker)
 

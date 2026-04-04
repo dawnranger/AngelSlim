@@ -112,7 +112,7 @@ class Eagle3Trainer(Trainer, ABC):
         self._perf_total_step_time: float = 0.0
         self._perf_last_step_end: float = 0.0
         self._perf_dataloader_wait_time: float = 0.0
-        self._perf_log_interval: int = 50  # Log performance stats every N global steps
+        self._perf_log_interval: int = 20  # Log performance stats every N global steps
         self._perf_last_logged_global_step: int = 0  # Last global step when PERF was logged
 
         # PyTorch Profiler

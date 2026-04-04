@@ -240,6 +240,10 @@ class MemmapOfflineEagle3Dataset(Dataset):
         self._dir_offsets = []  # [np.memmap, ...]
         self._dir_metadata = []  # [metadata_dict, ...]
 
+        # Storage optimization attributes
+        self._storage_precision = "float32"  # Default precision
+        self._int8_quantization = False  # Whether int8 quantization is enabled
+
         total_samples = 0
         for dir_idx, memmap_dir in enumerate(memmap_dirs):
             metadata_path = os.path.join(memmap_dir, "metadata.json")
@@ -248,6 +252,12 @@ class MemmapOfflineEagle3Dataset(Dataset):
 
             self._dir_metadata.append(metadata)
             n_samples = metadata["total_samples"]
+
+            # Read storage optimization config
+            if "storage_optimization" in metadata:
+                storage_opt = metadata["storage_optimization"]
+                self._storage_precision = storage_opt.get("precision", "float32")
+                self._int8_quantization = storage_opt.get("int8_quantization", False)
 
             # Open memmap files (read-only mode)
             field_memmaps = {}
@@ -289,6 +299,8 @@ class MemmapOfflineEagle3Dataset(Dataset):
             rank0_print(
                 f"[MemmapDataset] Dir {dir_idx}: {memmap_dir} "
                 f"({n_samples} samples, {metadata.get('total_tokens', 'N/A')} total tokens)"
+                f" | Storage Opt: precision={self._storage_precision}, "
+                f"int8_quantization={self._int8_quantization}"
             )
 
         self.total_samples = total_samples
@@ -298,36 +310,30 @@ class MemmapOfflineEagle3Dataset(Dataset):
             f"from {len(memmap_dirs)} memmap directories"
         )
 
-    def __len__(self) -> int:
-        return self.total_samples
+    def _convert_precision(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Convert tensor precision based on storage config."""
+        if self._storage_precision == "bfloat16":
+            return tensor.to(torch.bfloat16)
+        elif self._storage_precision == "float16":
+            return tensor.to(torch.float16)
+        else:  # float32 or unknown
+            return tensor.to(torch.float32)
 
-    def get_sample_length(self, idx: int) -> int:
-        """Get the sequence length of a sample without loading data.
-
-        This is an O(1) operation that only reads from the offsets array,
-        useful for length-based bucketing samplers to reduce padding waste.
+    @staticmethod
+    def _dequantize_per_token_absmax_int8(
+        quantized: torch.Tensor, scale: torch.Tensor, target_dtype: torch.dtype = torch.bfloat16
+    ):
+        """Dequantize per-token absmax int8 back to float.
 
         Args:
-            idx: Global sample index.
+            quantized: int8 tensor of shape [B, N, D]
+            scale: float tensor of shape [B, N, 1]
+            target_dtype: Target float dtype
 
         Returns:
-            Sequence length (number of tokens) of the sample.
+            Dequantized float tensor of shape [B, N, D]
         """
-        dir_idx, local_idx = self.global_index[idx]
-        offsets = self._dir_offsets[dir_idx]
-        return int(offsets[local_idx + 1]) - int(offsets[local_idx])
-
-    def get_all_sample_lengths(self) -> np.ndarray:
-        """Get sequence lengths for all samples efficiently.
-
-        Returns:
-            numpy array of shape (total_samples,) with each sample's length.
-        """
-        lengths = np.empty(self.total_samples, dtype=np.int64)
-        for i, (dir_idx, local_idx) in enumerate(self.global_index):
-            offsets = self._dir_offsets[dir_idx]
-            lengths[i] = int(offsets[local_idx + 1]) - int(offsets[local_idx])
-        return lengths
+        return quantized.to(target_dtype) * scale.to(target_dtype)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         dir_idx, local_idx = self.global_index[idx]
@@ -348,9 +354,26 @@ class MemmapOfflineEagle3Dataset(Dataset):
             # additional copy.
             tensor = torch.from_numpy(np.ascontiguousarray(arr))
 
+            # Apply precision conversion for float tensors (skip int8 quantized data)
+            if tensor.is_floating_point():
+                tensor = self._convert_precision(tensor)
+
             # Add batch dimension [1, seq_len, ...]
             tensor = tensor.unsqueeze(0)
             data[field_name] = tensor
+
+        # Dequantize int8 quantized hidden_states and target_hiddens
+        if self._int8_quantization:
+            target_dtype = (
+                torch.bfloat16 if self._storage_precision == "bfloat16" else torch.float16
+            )
+            for base_name in ("hidden_states", "target_hiddens"):
+                int8_key = f"{base_name}_int8"
+                scales_key = f"{base_name}_scales"
+                if int8_key in data and scales_key in data:
+                    data[base_name] = self._dequantize_per_token_absmax_int8(
+                        data.pop(int8_key), data.pop(scales_key), target_dtype=target_dtype
+                    )
 
         # Generate attention_mask
         if "input_ids" in data:
@@ -463,7 +486,7 @@ class LengthBucketSampler(Sampler):
         super().__init__(dataset)
         self.dataset = dataset
         self.batch_size = batch_size
-        self.bucket_size = bucket_size or max(batch_size * 50, 100)
+        self.bucket_size = bucket_size or max(batch_size * 20, 100)
         self.seed = seed
         self.epoch = 0
 
