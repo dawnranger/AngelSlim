@@ -87,14 +87,15 @@ class Eagle3Trainer(Trainer, ABC):
         )  # cache acc/ploss log for merging with base Trainer's loss log
         self._pending_log_count: int = 0  # accumulated batch count for averaging the cached log
 
-        # Performance profiling counters
-        self._perf_step_count: int = 0
+        # Performance profiling counters (tracks micro-steps, i.e. compute_loss calls)
+        self._perf_micro_step_count: int = 0
         self._perf_data_prep_time: float = 0.0
         self._perf_forward_time: float = 0.0
         self._perf_total_step_time: float = 0.0
         self._perf_last_step_end: float = 0.0
         self._perf_dataloader_wait_time: float = 0.0
-        self._perf_log_interval: int = 50  # Log performance stats every N steps
+        self._perf_log_interval: int = 50  # Log performance stats every N global steps
+        self._perf_last_logged_global_step: int = 0  # Last global step when PERF was logged
 
         # PyTorch Profiler
         self._enable_profiler = enable_profiler
@@ -117,19 +118,23 @@ class Eagle3Trainer(Trainer, ABC):
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-        # Schedule: wait 2 steps, then actively profile steps 3-5, no repeat.
-        # step() call index:  0(wait)  1(wait)  2(active)  3(active)  4(active)
-        # Corresponding training step:  1        2          3           4          5
-        # After step index 4 the profiler cycle is done and we stop it immediately.
+        # Profiler schedule is defined in terms of global steps.
+        # Since profiler.step() is called per micro-step (each compute_loss call),
+        # we multiply by gradient_accumulation_steps to convert global steps to micro-steps.
+        grad_accum = self.args.gradient_accumulation_steps
+        wait_global = 5  # Skip first 5 global steps (warmup / JIT compilation)
+        warmup_global = 1  # 1 global step warmup
+        active_global = 3  # Actively profile 3 global steps
+
         profiler_schedule = schedule(
-            wait=19,  # Skip first 2 steps (warmup / JIT compilation)
-            warmup=0,  # No warmup – start recording right at step 3
-            active=3,  # Actively profile 3 steps (step 3, 4, 5)
-            repeat=1,  # Single cycle, no repeat
+            wait=wait_global * grad_accum,
+            warmup=warmup_global * grad_accum,
+            active=active_global * grad_accum,
+            repeat=1,
         )
 
-        # Total profiler.step() calls needed = wait + warmup + active = 5
-        self._profiler_total_steps = 2 + 0 + 3  # 5
+        # Total profiler.step() calls needed = (wait + warmup + active) * grad_accum
+        self._profiler_total_steps = (wait_global + warmup_global + active_global) * grad_accum
         self._profiler_step_count = 0
 
         activities = [ProfilerActivity.CPU]
@@ -151,8 +156,18 @@ class Eagle3Trainer(Trainer, ABC):
 
         rank0_print("[PROFILER] PyTorch Profiler enabled")
         rank0_print(f"[PROFILER] Output dir: {profiler_output_dir}")
-        rank0_print("[PROFILER] Schedule: wait=2, warmup=0, active=3, repeat=1")
-        rank0_print("[PROFILER] Will profile training steps 3-5, then auto-stop")
+        rank0_print(
+            f"[PROFILER] Schedule: wait={wait_global} global steps, "
+            f"warmup={warmup_global} global steps, active={active_global} global steps, repeat=1"
+        )
+        rank0_print(
+            f"[PROFILER] Will profile global steps {wait_global + warmup_global + 1}-"
+            f"{wait_global + warmup_global + active_global}, then auto-stop"
+        )
+        rank0_print(
+            f"[PROFILER] Total profiler micro-steps: {self._profiler_total_steps} "
+            f"(grad_accum={grad_accum})"
+        )
         rank0_print(f"[PROFILER] Activities: {[a.name for a in activities]}")
         rank0_print(
             "[PROFILER] Features: record_shapes=True, profile_memory=True, "
@@ -335,7 +350,7 @@ class Eagle3Trainer(Trainer, ABC):
 
         total_step_time = time.time() - step_start
         self._perf_total_step_time += total_step_time
-        self._perf_step_count += 1
+        self._perf_micro_step_count += 1
         self._perf_last_step_end = time.time()
 
         # Step the profiler and auto-stop after the scheduled cycle completes
@@ -344,14 +359,22 @@ class Eagle3Trainer(Trainer, ABC):
             self._profiler_step_count += 1
             if self._profiler_step_count >= self._profiler_total_steps:
                 self._stop_profiler()
+                profiler_macro_steps = self._profiler_step_count // max(
+                    self.args.gradient_accumulation_steps, 1
+                )
                 rank0_print(
-                    f"[PROFILER] Profiling complete after step {self._profiler_step_count}. "
-                    f"Training continues without profiler overhead."
+                    f"[PROFILER] Profiling complete after {self._profiler_step_count} micro-steps"
+                    f" (~{profiler_macro_steps} global steps)"
                 )
 
-        # Log performance stats periodically
-        if self._perf_step_count % self._perf_log_interval == 0:
-            n = self._perf_step_count
+        # Log performance stats periodically based on global steps
+        current_global_step = self.state.global_step if self.state is not None else 0
+        if (
+            current_global_step > 0
+            and current_global_step >= self._perf_last_logged_global_step + self._perf_log_interval
+            and self._perf_micro_step_count > 0
+        ):
+            n = self._perf_micro_step_count
             avg_total = self._perf_total_step_time / n * 1000
             avg_data_prep = self._perf_data_prep_time / n * 1000
             avg_forward = self._perf_forward_time / n * 1000
@@ -363,7 +386,7 @@ class Eagle3Trainer(Trainer, ABC):
             seq_len = input_ids.shape[1]
 
             rank0_print(
-                f"[PERF] Step {n} | "
+                f"[PERF] Global step {current_global_step} (micro-steps: {n}) | "
                 f"avg_step={avg_total:.1f}ms | "
                 f"avg_data_prep={avg_data_prep:.1f}ms | "
                 f"avg_forward={avg_forward:.1f}ms | "
@@ -373,7 +396,8 @@ class Eagle3Trainer(Trainer, ABC):
             )
 
             # Reset counters to get recent averages
-            self._perf_step_count = 0
+            self._perf_last_logged_global_step = current_global_step
+            self._perf_micro_step_count = 0
             self._perf_data_prep_time = 0.0
             self._perf_forward_time = 0.0
             self._perf_total_step_time = 0.0
