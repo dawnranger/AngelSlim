@@ -62,6 +62,52 @@ class TargetHead(nn.Module):
         logits = self.lm_head(hidden_states)
         return logits
 
+    def forward_with_vocab_mapping(
+        self, hidden_states: torch.Tensor, t2d: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute logits only for draft vocabulary tokens, avoiding full vocab projection.
+
+        Instead of computing [B, S, full_vocab] and then gathering with t2d (boolean mask),
+        this method first slices the lm_head weight matrix to only include
+        draft-vocab rows, then performs a smaller matmul:
+        [B, S, hidden_size] x [hidden_size, draft_vocab_size].
+
+        This reduces computation by ~full_vocab/draft_vocab (e.g., 152064/32000 ≈ 4.75x)
+        and avoids materializing the full [B, S, 152064] logits tensor.
+
+        Dtype conversion is handled internally: if hidden_states dtype differs from
+        the cached weight dtype, hidden_states is cast automatically.
+
+        Args:
+            hidden_states: Hidden states from target model with shape
+                          (batch_size, seq_length, hidden_size)
+            t2d: Boolean mask tensor with shape (full_vocab_size,).
+                 t2d[i] = True means target token i is in the draft vocabulary.
+                 The True positions, when sorted, give the target token indices
+                 for draft tokens 0, 1, 2, ... (matching the original boolean indexing).
+
+        Returns:
+            Logits with shape (batch_size, seq_length, draft_vocab_size)
+        """
+        # Cache the sliced weight matrix after first call for efficiency.
+        # t2d is a boolean mask: True positions correspond to draft vocab tokens.
+        # t2d.nonzero().squeeze(-1) gives sorted target token indices for draft vocab,
+        # which is equivalent to the original `logits[..., t2d]` boolean indexing.
+        if not hasattr(self, "_sliced_weight") or self._sliced_weight is None:
+            draft_token_indices = t2d.nonzero(as_tuple=False).squeeze(-1)  # [draft_vocab_size]
+            # Slice and cache: [draft_vocab_size, hidden_size]
+            self._sliced_weight = self.lm_head.weight[draft_token_indices].detach()
+
+        # Cast hidden_states to match the cached weight dtype if needed
+        # (e.g. pre-computed hidden states may be float16 while weights are bfloat16)
+        if hidden_states.dtype != self._sliced_weight.dtype:
+            hidden_states = hidden_states.to(self._sliced_weight.dtype)
+
+        # Compute logits: [B, S, hidden_size] @ [hidden_size, draft_vocab_size]
+        logits = torch.nn.functional.linear(hidden_states, self._sliced_weight)
+        return logits
+
     @classmethod
     def from_pretrained(
         cls,

@@ -18,6 +18,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 from torch.profiler import (
@@ -32,7 +33,24 @@ from transformers import Trainer
 from angelslim.utils import rank0_print
 from angelslim.utils.lazy_imports import deepspeed
 
-from ...utils import padding
+
+def _shift_left(tensor: torch.Tensor, n: int) -> torch.Tensor:
+    """Shift tensor left by n positions along dim=1 with zero-padding on the right.
+
+    Equivalent to calling ``padding(tensor, left=False)`` n times, but avoids
+    creating intermediate tensors for each shift step.
+    """
+    if n <= 0:
+        return tensor
+    seq_len = tensor.shape[1]
+    if n >= seq_len:
+        return torch.zeros_like(tensor)
+    # Slice off the first n tokens and pad n zeros on the right
+    sliced = tensor[:, n:, ...]
+    pad_shape = list(tensor.shape)
+    pad_shape[1] = n
+    zeros = torch.zeros(pad_shape, dtype=tensor.dtype, device=tensor.device)
+    return torch.cat((sliced, zeros), dim=1)
 
 
 def _gpu_mem_stats(device=None):
@@ -419,6 +437,11 @@ class Eagle3Trainer(Trainer, ABC):
         Down project hidden states for draft model training.
         """
         # Step 4: Prepare hidden states with gradient tracking
+        # Cast hidden_states to the model's dtype to avoid dtype mismatch
+        # (e.g. pre-computed hidden states may be float16 while model weights are bfloat16)
+        model_dtype = next(self.draft_model.parameters()).dtype
+        if hidden_states.dtype != model_dtype:
+            hidden_states = hidden_states.to(model_dtype)
         if not hidden_states.requires_grad:
             hidden_states.requires_grad = True
         hidden_states = self.draft_model.combine_hidden_states(hidden_states)
@@ -481,43 +504,44 @@ class Eagle3Trainer(Trainer, ABC):
         cache_hidden = [[], []]
 
         # Pre-compute target distribution outside the loop to avoid
-        # redundant t2d gather + softmax (each is expensive on full vocab).
-        # Build a list of (target_p, position_mask, target_p_argmax) for each iteration,
+        # redundant computation. Since target_logits is already in draft vocab space
+        # (from TargetHead.forward_with_vocab_mapping), we skip the t2d gather.
+        # Build a list of (target_log_p, position_mask, target_p_argmax) for each iteration,
         # applying the padding shift incrementally.
-        t2d = self.draft_model.t2d
         precomputed_targets = []
-        _tl = target_logits
-        _lm = loss_mask
-        _ids = input_ids
         with record_function("precompute_targets"):
             for idx in range(self.length):
+                # Use direct slicing instead of repeated padding() calls.
+                # _shift_left(t, n) shifts tensor left by n positions (equivalent to
+                # calling padding(t, left=False) n times) without intermediate tensors.
+                #
+                # target_logits and input_ids need (idx+1) shift because the initial
+                # padding(left=False) that was previously in prepare_data_for_draft_model
+                # has been folded into this loop.
+                # loss_mask needs idx shift (it was never padded in prepare_data).
+                _tl = _shift_left(target_logits, idx + 1)
+                _ids = _shift_left(input_ids, idx + 1)
+                _lm = _shift_left(loss_mask, idx) if idx > 0 else loss_mask
                 with torch.no_grad():
-                    target_max_token = _tl.argmax(-1)
-                    target_mask = t2d[target_max_token][..., None].int()
-                    position_mask = target_mask * _lm
-                    target_head = _tl[..., t2d].float()
-                    target_p = nn.Softmax(dim=2)(target_head).detach()
-                    target_p_argmax = target_p.argmax(-1)
-                precomputed_targets.append((target_p, position_mask, target_p_argmax, _lm, _ids))
-                if idx < self.length - 1:
-                    _tl = padding(_tl, left=False)
-                    _lm = padding(_lm, left=False)
-                    _ids = padding(_ids, left=False)
-        del _tl, _lm, _ids, target_logits
+                    position_mask = _lm
+                    target_log_p = F.log_softmax(_tl.float(), dim=2).detach()
+                    target_p_argmax = _tl.argmax(-1)
+                precomputed_targets.append(
+                    (target_log_p, position_mask, target_p_argmax, _lm, _ids)
+                )
+        del target_logits
 
         # Step 7: Iterative speculative decoding training loop
         for idx in range(self.length):
-            target_p, position_mask, target_p_argmax, cur_loss_mask, cur_input_ids = (
+            target_log_p, position_mask, target_p_argmax, cur_loss_mask, cur_input_ids = (
                 precomputed_targets[idx]
             )
 
             # Step 7.1: Get input embeddings with gradient tracking
             with record_function(f"spec_step_{idx}/embed"):
-                if idx == 0:
-                    cur_input_ids_for_embed = input_ids
-                else:
-                    cur_input_ids_for_embed = cur_input_ids
-                inputs_embeds = self.draft_model.embed_input_ids(cur_input_ids_for_embed)
+                # cur_input_ids from precomputed_targets already has the correct
+                # left-shift applied (idx+1 positions), so use it for all steps.
+                inputs_embeds = self.draft_model.embed_input_ids(cur_input_ids)
                 if not inputs_embeds.requires_grad:
                     inputs_embeds.requires_grad = True
 
@@ -551,10 +575,19 @@ class Eagle3Trainer(Trainer, ABC):
             with record_function(f"spec_step_{idx}/compute_logits"):
                 logits = self.draft_model.compute_logits(hidden_states)
 
-            # Step 7.5: Compute loss (target_p and position_mask are pre-computed)
+            # Step 7.5: Compute loss (KL divergence between target and draft distributions)
+            # Optimization: use F.kl_div with log_target=True for fused CUDA kernel.
+            # KL(target || draft) differs from cross-entropy by a constant (target entropy),
+            # so gradients are identical. Loss values will differ from the original
+            # cross-entropy formulation but training behavior is unchanged.
             with record_function(f"spec_step_{idx}/loss_computation"):
-                out_logp = nn.LogSoftmax(dim=2)(logits)
-                loss = -torch.sum(position_mask * target_p * out_logp, dim=2).mean()
+                out_log_p = F.log_softmax(logits, dim=2)
+                # Compute per-token KL divergence, then apply position mask
+                kl_per_vocab = F.kl_div(
+                    out_log_p, target_log_p, log_target=True, reduction="none"
+                )  # [B, S, draft_vocab_size]
+                # Sum over vocab dim -> [B, S, 1], apply position mask, then mean
+                loss = (kl_per_vocab.sum(dim=2, keepdim=True) * position_mask).mean()
 
             # Step 7.6: Compute accuracy
             with torch.no_grad():
